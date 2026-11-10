@@ -14874,6 +14874,65 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err, in
     }
     return p.feed_windows(tokens, n, logits_rows, err);
 }
+bool Model::boundary_feed(int64_t p0, const int* tokens, int n, const float* h, const float* pre,
+                          int logits_rows, std::string& err) {
+#if !defined(STRATA_METAL)
+    err = "boundary replay: only the single-device Metal diagnostic is implemented";
+    return false;
+#else
+    Impl& p = *p_;
+    if (p.devs.size() != 1 || p.par || p.g.nl != 40 || p.g.hc != 4 || p.g.dim != 5120 ||
+        p.o.seqs != 1 || p.o.vision || p.o.dspark || p.chunk != 0 || p.g.n_mtp != 0 || !p.sync_decode ||
+        !p.L[20].kv_src || !p.L[20].ix_src || !p.L[20].cand_src || p.L[20].uses_cand || p.L[20].ratio != 1) {
+        err = "boundary replay requires full-pack cut20, one Metal device, synchronous window path, no vision/drafter/MTP";
+        return false;
+    }
+    if (p0 != p.pos || n < 1 || n > kWin || p0 + n > p.o.max_context ||
+        (logits_rows != 0 && logits_rows != 1) || !tokens || !h || !pre) {
+        err = "boundary replay: invalid or out-of-order window";
+        return false;
+    }
+    for (int il = 20; il < p.g.nl; ++il) {
+        const auto& l = p.L[(size_t) il];
+        if (l.eg >= 0 || l.src < p.L[20].src || l.ik_src < p.L[20].ik_src) {
+            err = "boundary replay: tail depends on a front-stage source";
+            return false;
+        }
+    }
+    for (int t = 0; t < n; ++t) {
+        if (tokens[t] < 0 || tokens[t] >= p.g.vocab) { err = "boundary replay: token out of range"; return false; }
+    }
+    for (size_t i = 0; i < (size_t) n * 4 * 5120; ++i)
+        if (!std::isfinite(h[i])) { err = "boundary replay: nonfinite h"; return false; }
+    for (size_t i = 0; i < (size_t) n * 8; ++i)
+        if (!std::isfinite(pre[i])) { err = "boundary replay: nonfinite pre"; return false; }
+    p.slot_held = false;
+    p.logits_all = false;
+    p.n_logits = logits_rows;
+    p.fed_n = n;
+    p.prof_window = false;
+    for (int t = 0; t < n; ++t) {
+        p.toks.push_back(tokens[t]);
+        p.ctoks.push_back(p.ctok(p0 + t, tokens[t]));
+    }
+    p.wplan.nrow = 0;
+    p.plan_window(p0, n, p.wplan);
+    auto& d = p.devs[0];
+    CK(cudaSetDevice(d.id));
+    CK(cudaMemcpyAsync(d.h, h, (size_t) n * 4 * 5120 * 4, cudaMemcpyHostToDevice, d.st));
+    CK(cudaMemcpyAsync(d.pre, pre, (size_t) n * 8 * 4, cudaMemcpyHostToDevice, d.st));
+    // L20 owns and overwrites KV/index/topk/candidates; nothing from L0-19 is consumed.
+    for (int il = 20; il < p.g.nl; ++il)
+        if (!p.layer(p.L[(size_t) il], 0, p0, n, p.wplan, err)) return false;
+    if (!p.head_rows_dev(p.head_dev, n, err)) return false;
+    CK(cudaStreamSynchronize(d.st));
+    p.pos += n;
+    p.st.tokens += n;
+    p.cache_tick(n);
+    return true;
+#endif
+}
+
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
     p.pm.last = -1;

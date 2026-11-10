@@ -120,7 +120,9 @@ void usage() {
                  "           [--vision on|off] [--vision-resident (--serve: keep the picture tower on the card; default: in RAM between pictures)] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
-                 "           | --pack-info)\n");
+                 "           | --boundary-replay FILE --boundary-logits NEWFILE [--boundary-repeat 1|2]\n"
+                 "           | --pack-info)\n"
+                 "boundary replay: local full-pack cut20 Metal/window diagnostic, not partial loading or RPC\n");
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes.  read(2), not std::cin - glibc's exit()
@@ -2475,6 +2477,72 @@ int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
     return tokens_same && spec_same && same_rows == rows ? 0 : 1;
 }
 
+// Opt-in local diagnostic. All records are validated before the first GPU replay.
+int boundary_replay(strata::ds4::Model& m, const std::string& path, const std::string& output, int repeats) {
+    struct Record { int64_t p0; uint32_t T, logits; std::vector<int> ids; std::vector<float> h, pre; };
+    std::ifstream in(path, std::ios::binary);
+    auto read = [&](void* p, size_t n) { return bool(in.read((char*) p, (std::streamsize) n)); };
+    char magic[8]; uint32_t header[6];
+    const uint32_t endian = 1;
+    if (*(const uint8_t*) &endian != 1 || !read(magic, 8) || std::memcmp(magic, "TCBND001", 8) != 0 ||
+        !read(header, sizeof header) || header[0] != 20 || header[1] != 4 || header[2] != 5120 ||
+        header[3] != (uint32_t) m.vocab() || header[4] < 1 || header[4] > 8192 || header[5] < 1 || header[5] > 8192) {
+        std::fprintf(stderr, "boundary replay: invalid header/geometry\n"); return 2;
+    }
+    std::vector<Record> records;
+    int64_t pos = 0;
+    for (uint32_t k = 0; k < header[4]; ++k) {
+        Record r;
+        if (!read(&r.p0, 8) || !read(&r.T, 4) || !read(&r.logits, 4) || r.p0 != pos ||
+            r.T < 1 || r.T > 16 || pos + r.T > m.max_context() || pos + r.T > 8192 || pos + r.T > header[5] + 128 ||
+            (pos < header[5] && pos + r.T > header[5]) || (pos >= header[5] && r.T != 1) ||
+            r.logits != (uint32_t) (pos + r.T >= header[5])) {
+            std::fprintf(stderr, "boundary replay: invalid record %u\n", k); return 2;
+        }
+        r.ids.resize(r.T); r.h.resize((size_t) r.T * 4 * 5120); r.pre.resize((size_t) r.T * 8);
+        if (!read(r.ids.data(), r.T * 4) || !read(r.h.data(), r.h.size() * 4) || !read(r.pre.data(), r.pre.size() * 4)) {
+            std::fprintf(stderr, "boundary replay: truncated record\n"); return 2;
+        }
+        for (int id : r.ids) if (id < 0 || id >= m.vocab()) {
+            std::fprintf(stderr, "boundary replay: invalid token\n"); return 2;
+        }
+        for (const auto* v : {&r.h, &r.pre}) for (float x : *v) if (!std::isfinite(x)) {
+            std::fprintf(stderr, "boundary replay: nonfinite input\n"); return 2;
+        }
+        pos += r.T;
+        records.push_back(std::move(r));
+    }
+    if (pos < header[5] || in.peek() != std::char_traits<char>::eof()) {
+        std::fprintf(stderr, "boundary replay: incomplete prefill or trailing data\n"); return 2;
+    }
+    for (int pass = 0; pass < repeats; ++pass) {
+        const std::string name = output + (pass ? ".reset.f32" : "");
+        std::FILE* out = std::fopen(name.c_str(), "wbx");
+        if (!out) { std::fprintf(stderr, "boundary replay: output must be new: %s\n", name.c_str()); return 2; }
+        std::unique_ptr<std::FILE, decltype(&std::fclose)> close(out, std::fclose);
+        m.reset();
+        m.begin_request();
+        std::vector<float> lg;
+        std::string err;
+        for (const Record& r : records) {
+            if (!m.boundary_feed(r.p0, r.ids.data(), (int) r.T, r.h.data(), r.pre.data(), (int) r.logits, err)) {
+                std::fprintf(stderr, "boundary replay at %lld: %s\n", (long long) r.p0, err.c_str()); return 1;
+            }
+            if (r.logits) {
+                if (!m.logits(lg) || lg.size() != (size_t) m.vocab() ||
+                    !std::all_of(lg.begin(), lg.end(), [](float x) { return std::isfinite(x); }) ||
+                    std::fwrite(lg.data(), 4, lg.size(), out) != lg.size()) {
+                    std::fprintf(stderr, "boundary replay: missing logits or write failure\n"); return 1;
+                }
+                const int top = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+                std::printf("BOUNDARY pass=%d p0=%lld T=%u top1=%d\n", pass, (long long) r.p0, r.T, top);
+            }
+        }
+        if (std::fflush(out) != 0) { std::fprintf(stderr, "boundary replay: flush failed\n"); return 1; }
+    }
+    return 0;
+}
+
 }  // namespace
 
 #ifndef DS4_BUILD_ID
@@ -2507,6 +2575,9 @@ int main(int argc, char** argv) {
     bool pack_info_mode = false;
     std::string images, enc_rgb, enc_out;
     std::string score_ids, score_out, prof_ids, spec_ids;
+    std::string boundary_path, boundary_output;
+    int boundary_repeats = 1;
+    bool boundary_mode = false;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2571,6 +2642,14 @@ int main(int argc, char** argv) {
             std::printf("strata-dsv41 %s build %s\n", STRATA_VERSION, DS4_BUILD_ID);
             return 0;
         }
+        else if (a == "--boundary-replay") { boundary_mode = true; boundary_path = val("--boundary-replay"); }
+        else if (a == "--boundary-logits") { boundary_mode = true; boundary_output = val("--boundary-logits"); }
+        else if (a == "--boundary-repeat") {
+            boundary_mode = true;
+            const std::string v = val("--boundary-repeat");
+            if (v != "1" && v != "2") { std::fprintf(stderr, "--boundary-repeat takes 1 or 2\n"); return 2; }
+            boundary_repeats = v == "2" ? 2 : 1;
+        }
         else if (a == "--ids") ids_s = val("--ids");
         else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
@@ -2599,6 +2678,13 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (boundary_mode &&
+        (boundary_path.empty() || boundary_output.empty() || pack_info_mode || serve_mode ||
+         !ids_s.empty() || !enc_rgb.empty() || !score_ids.empty() || !prof_ids.empty() || !spec_ids.empty() || multi_check ||
+         !images.empty() || !dump.empty() || n != 0 || window != 0)) {
+        std::fprintf(stderr, "--boundary-replay FILE --boundary-logits NEWFILE [--boundary-repeat 1|2] is a standalone diagnostic\n");
+        return 2;
+    }
     if (pack_info_mode) {   // the pack's description only: no device, no weights, no lock
         if (o.pack.empty()) {
             usage();
@@ -2610,7 +2696,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--multi-check needs --parallel 2..8 and --ids\n");
         return 2;
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
+    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty() && boundary_path.empty())) {
         usage();
         return 2;
     }
@@ -2626,6 +2712,7 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (const char* idle = std::getenv("DS4_TEST_IDLE_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(idle)));   // (tests: a person typing)
+    if (!boundary_path.empty()) return boundary_replay(m, boundary_path, boundary_output, boundary_repeats);
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
     const int window_given = window;
     if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)

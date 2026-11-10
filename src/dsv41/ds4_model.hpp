@@ -227,6 +227,12 @@ public:
                       uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
     int verify_max() const;   // the rows a window or a multi step takes at most
 
+    // Tectonic diagnostic only: a full-pack, single-Metal-device window enters at L20.
+    // Caller must reset first and supply every window from position zero in order.
+    // Front-stage caches are not built; reset again before using normal feed/step.
+    bool boundary_feed(int64_t p0, const int* tokens, int n, const float* h, const float* pre,
+                       int logits_rows, std::string& err);
+
     void reset();
     /// The post-prompt cache settle run on a thread of its own while the server waits for its next request (WP-8's option 1):
     /// the swap rounds of cache_settle without the store preload, stopped early when `cancel` goes true.  `done` is set when
