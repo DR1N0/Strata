@@ -604,6 +604,14 @@ struct Options {
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
     int64_t max_context = 4096;
+    /// A STAGE OF A SPLIT, RUN IN THIS PROCESS: the layers this process owns, `[stage_begin, stage_end)`.
+    /// `stage_end < 0` is the whole model (every caller before this).  The session carves only this range
+    /// (session_init) and the graphs cover only it (session_capture); `--stage-input` / `--stage-output`
+    /// carry the residual in and out when the range is neither the head nor the tail of the model.
+    int64_t stage_begin = 0;
+    int64_t stage_end = -1;
+    std::string stage_input;    ///< a file holding this stage's input residual (hc x n_embd floats per row)
+    std::string stage_output;   ///< where this stage writes its output residual
     bool greedy = true;
     uint64_t seed = 0;
     int top_k = 20;
@@ -3420,6 +3428,10 @@ int main(int argc, char** argv) {
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
+        else if (a == "--stage-begin") o.stage_begin = std::atoll(next("--stage-begin"));
+        else if (a == "--stage-end") o.stage_end = std::atoll(next("--stage-end"));
+        else if (a == "--stage-input") o.stage_input = next("--stage-input");
+        else if (a == "--stage-output") o.stage_output = next("--stage-output");
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
         else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(next("--rope-freq-base"));
@@ -6765,7 +6777,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, o.stage_begin, o.stage_end >= 0 ? o.stage_end : hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -9197,8 +9209,8 @@ int main(int argc, char** argv) {
         // a layer split's CUDA0 session owns only [0, split_at[0]), so its graphs cover that range; the
         // whole-model replay paths (`session_loop`, the plain generate loop) refuse rather than read another
         // stage's state - a split runs its layers on the stages' verifiers (serve) or prefill stage chain
-        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, 0,
-                                           multi_gpu ? split_at[0] : -1)) {
+        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages,
+                                           o.stage_begin, o.stage_end >= 0 ? o.stage_end : (multi_gpu ? split_at[0] : -1))) {
             std::fprintf(stderr, "strata generate: session_capture: %s\n", err.c_str());
             return 1;
         }
@@ -9264,7 +9276,38 @@ int main(int argc, char** argv) {
     // broadcast to all `hc` streams.  After that `session_zero` would also wipe the recurrence, so the
     // broadcast is done directly.  Getting this wrong is invisible for exactly one token.
     void* token_stream = o.stream_token ? main_cs : nullptr;
+    // ---- A STAGE THAT DOES NOT OWN LAYER 0 READS ITS INPUT RESIDUAL INSTEAD OF EMBEDDING A TOKEN.
+    //
+    // The residual `ss.R` is `(hc, n_embd)` contiguous, and `--dump-final-r` writes exactly those floats after a
+    // `{pos, tok}` pair.  So a stage's input file is another stage's output file, unchanged, and the copy below
+    // is the whole hand-off on one machine.  Reading sequentially assumes the positions arrive in order, which
+    // is what every caller of this loop does.
+    std::FILE* stage_in = nullptr;
+    if (!o.stage_input.empty()) {
+        stage_in = std::fopen(o.stage_input.c_str(), "rb");
+        if (stage_in == nullptr) {
+            std::fprintf(stderr, "strata generate: cannot read --stage-input %s\n", o.stage_input.c_str());
+            return 1;
+        }
+    }
+    std::vector<float> stage_row((size_t) g.hc * (size_t) g.n_embd);
+    int64_t stage_row_i = 0;
     auto put_input = [&](int64_t tok, int64_t pos) -> bool {
+        if (stage_in != nullptr) {
+            int64_t posrec[2] = {0, 0};
+            if (std::fread(posrec, sizeof posrec, 1, stage_in) != 1 ||
+                std::fread(stage_row.data(), sizeof(float), stage_row.size(), stage_in) != stage_row.size()) {
+                std::fprintf(stderr, "strata generate: --stage-input %s ended at row %lld (position %lld)\n",
+                             o.stage_input.c_str(), (long long) stage_row_i, (long long) pos);
+                return false;
+            }
+            ++stage_row_i;
+            if (cudaMemcpy(ss.R, stage_row.data(), stage_row.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: the stage input copy failed\n");
+                return false;
+            }
+            return o.stream_token || cudaDeviceSynchronize() == cudaSuccess;
+        }
         if (!strata::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return false;
