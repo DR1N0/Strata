@@ -587,7 +587,18 @@ void SessionLoopScratch::free() {
 bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
                   PoolFn pool, HitFn hits, void* user, bool overlap, void* stream, std::string& err,
                   float* dump_layers, SessionLoopScratch* scratch) {
-    if (!gr.captured || gr.n != g.n_layers) { err = "session_loop: not captured"; return false; }
+    if (!gr.captured) { err = "session_loop: not captured"; return false; }
+    // ---- THE LAYER RANGE (a stage of a split, in one process).
+    //
+    // `session_init` already carves only [layer_lo, layer_hi) of the GDN/QSA state and
+    // `session_capture` already captures only that range's graphs (the other `execs[l]` stay
+    // null).  The loop was the last place that still assumed all `g.n_layers`: it launched
+    // `execs[0]` and walked to `g.n_layers`, so a range would have launched null graphs.
+    //
+    // An empty/invalid range keeps the whole model, which is every caller before this.
+    int64_t lo = s.layer_lo, hi = s.layer_hi;
+    if (hi <= lo || hi > g.n_layers) { lo = 0; hi = g.n_layers; }
+    if (gr.n != hi - lo) { err = "session_loop: not captured"; return false; }
     if (gr.parts_dev == nullptr) { err = "session_loop: the graphs were captured without a parts buffer"; return false; }
     if (s.db == nullptr) { err = "session_loop: no doorbell; the loop has nothing to poll"; return false; }
 
@@ -669,7 +680,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     }
     {
         const auto t0 = std::chrono::steady_clock::now();
-        const cudaError_t le = cudaGraphLaunch(gr.execs[0], cs);
+        const cudaError_t le = cudaGraphLaunch(gr.execs[lo], cs);
         if (le != cudaSuccess) {
             err = "session_loop: launch pre[0]: " + std::string(cudaGetErrorString(le));
             return false;
@@ -678,7 +689,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         (void) t0;
     }
 
-    for (int64_t l = 0; l < g.n_layers; ++l) {
+    for (int64_t l = lo; l < hi; ++l) {
         const auto t_launch = std::chrono::steady_clock::now();
 
         // ---- poll for the ring.  **THE DRIVER CALL IS NOW A FALLBACK, NOT THE MECHANISM.**
@@ -775,7 +786,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // ---- and layer l+1's routing starts.  `pre[l+1]` touches none of the buffers `post[l]` reads, because
         // the two are ordered on one stream and `pre[l+1]`'s first use of `bb.mixed`/`bb.inject` is its own
         // `gr_read`, which comes after `post[l]` has consumed them.
-        if (l + 1 < g.n_layers) {
+        if (l + 1 < hi) {
             const cudaError_t ne = cudaGraphLaunch(gr.execs[l + 1], cs);
             if (ne != cudaSuccess) {
                 err = "session_loop: launch pre[" + std::to_string(l + 1) + "]: " + cudaGetErrorString(ne);
