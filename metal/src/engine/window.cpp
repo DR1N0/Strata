@@ -54,6 +54,7 @@ namespace strata::gpu { void* host_view(const void* device_pointer); }
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <thread>
 #include <vector>
 
@@ -455,6 +456,10 @@ private:
     }
     bool run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
     bool finish_rows(int S, const int32_t* tokens, int32_t* out, double t0);
+    void batch_evidence(const int* rows, int S, bool ran_rows);
+    uint64_t batch_evidence_windows_ = 0;
+    bool batch_evidence_rows_ = false;
+    std::vector<int> batch_evidence_slots_;
     struct SeqSet {
         std::vector<mtl::Buffer> gst, gh0, gh1, kq, vq, ksc, vsc, tail, dead, pooled;
         mtl::Buffer pleHist;
@@ -2156,12 +2161,47 @@ void Window::activate(int set) {
     active_ = set;
 }
 
+// Opt-in evidence of completed batch dispatches, not an atexit report (stdio serve uses _Exit).
+// Disabled: no counters, allocations, clock reads or output. Enabled: no added GPU work or synchronization.
+void Window::batch_evidence(const int* rows, int S, bool ran_rows) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("STRATA_METAL_BATCH_EVIDENCE");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    if (!enabled || S < 1) return;
+    ++batch_evidence_windows_;   // one successful run_slots dispatch, including the explicit serial fallback
+    const bool changed = batch_evidence_slots_.size() != (size_t) S || batch_evidence_rows_ != ran_rows ||
+                         !std::equal(batch_evidence_slots_.begin(), batch_evidence_slots_.end(), rows);
+    if (!changed && batch_evidence_windows_ % 64 != 0) return;
+    if (changed) {
+        batch_evidence_slots_.assign(rows, rows + S);
+        batch_evidence_rows_ = ran_rows;
+    }
+    // Python time.monotonic() on macOS uses this same Mach clock and timebase, not an assumed now_ms() epoch.
+    static const double seconds_per_tick = [] {
+        mach_timebase_info_data_t tb = {};
+        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.denom == 0) return 0.0;
+        return (double) tb.numer / (double) tb.denom / 1e9;
+    }();
+    if (seconds_per_tick == 0.0) return;
+    const double t = (double) mach_absolute_time() * seconds_per_tick;
+    std::string slots;
+    for (int i = 0; i < S; ++i) {
+        if (i) slots += ',';
+        slots += std::to_string(rows[i]);
+    }
+    std::fprintf(stderr, "METAL_BATCH_EVIDENCE t=%.9f windows=%llu path=%s width=%d slots=%s\n",
+                 t, (unsigned long long) batch_evidence_windows_, ran_rows ? "rows" : "serial", S, slots.c_str());
+}
+
 bool Window::run_slots(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err) {
     if (sets_.empty()) { err = "metal window: no batch slots"; return false; }
     static const bool one_window = !(std::getenv("STRATA_METAL_BATCH_ROWS") && std::string(std::getenv("STRATA_METAL_BATCH_ROWS")) == "0");
     if (one_window && bigs_ok_) {
         activate(0);
-        return run_rows(rows, S, tokens, pos, out, err);
+        const bool ok = run_rows(rows, S, tokens, pos, out, err);
+        if (ok) batch_evidence(rows, S, true);
+        return ok;
     }
     bool ok = true;
     for (int t = 0; t < S && ok; ++t) {
@@ -2172,6 +2212,7 @@ bool Window::run_slots(const int* rows, int S, const int32_t* tokens, const int6
         ok = run(1, tokens + t, pos[t], true, out + t, err) && commit(1, err);
     }
     activate(0);
+    if (ok) batch_evidence(rows, S, false);
     return ok;
 }
 

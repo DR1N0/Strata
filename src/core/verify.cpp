@@ -4681,6 +4681,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     // each row runs in its slot's state and commits there (a one-token window); nothing is left for commit_slots
     if (S < 1 || S > (int) strata::kernels::kVerifyMaxT) { err = "verify: batch window size out of range"; return false; }
     (void) pool; (void) user;
+    progress_at("verify batch: waiting for Metal window", S);
     if (!strata::metal_engine::window_run_slots(metal_, rows, S, tokens, pos, out, err)) return false;
     last_t_ = S;
     for (int t = 0; t < S; ++t) { last_rows_[t] = rows[t]; last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
@@ -4699,6 +4700,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             if (!strata::metal_engine::window_sample_slot_row(metal_, t, sp, hist, hlen, &out[t], err)) return false;
         }
     }
+    // Metal returns before the CUDA/HIP completion heartbeat below. A live batch
+    // can outlast the serve watchdog's limit; only successful windows beat.
+    progress_at("decode");
+    progress_beat();
     return true;
 #endif
     using namespace strata::kernels;
