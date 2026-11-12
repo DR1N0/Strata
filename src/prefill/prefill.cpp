@@ -1842,7 +1842,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     cudaGetDevice(&m.device);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
-    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
+    // A RANGE THAT STOPS SHORT WITHOUT AN IN-PROCESS SUCCESSOR IS A STAGE OF A CROSS-MACHINE SPLIT: it runs its
+    // layers, reports the chunk through `on_chunk`, and something outside this process carries the rows on. The
+    // old rule demanded `next_ != nullptr` whenever `stage_le_ < n_layers` (a layer split inside one process);
+    // that is still how a multi-GPU split runs, but it is no longer the only shape.
+    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers) {
         err = "prefill: the stage's layer range is wrong";
         return false;
     }

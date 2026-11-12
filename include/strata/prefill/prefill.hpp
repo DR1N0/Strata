@@ -264,6 +264,11 @@ public:
     /// previous stage instead of embedding the tokens; a stage that does not end at the last layer copies its rows
     /// to pinned host buffers (two, allocated by `init`) and runs `next` on them - on a thread, so the next stage
     /// reads chunk c while this one reads chunk c + 1.  `on_chunk` belongs on the last stage.  Set before `init`.
+    /// THE ROWS A PREVIOUS STAGE COMPUTED (host, pinned; `T` rows of `hc * n_embd` floats, row-major - the same
+    /// layout `--dump-final-r` writes, minus each row's `{pos, tok}` header).  Non-null: the chunk's embedding is
+    /// skipped and these rows are uploaded into `R` instead, which is what a stage of a cross-machine split needs.
+    /// Null (the default): the tokens are embedded, as before.
+    void set_hand_in(const float* rows) { hand_in_ = rows; }
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }

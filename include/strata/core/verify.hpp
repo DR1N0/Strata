@@ -43,6 +43,8 @@
 
 namespace strata::core {
 
+struct BoundaryFrame;   // boundary_wire.hpp
+
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
 /// bytes arrive layer by layer: `run` holds a layer's plan (the first thing that lets the GPU read the layer's expert
@@ -384,6 +386,13 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    /// THE BOUNDARY AS ONE OBJECT (boundary_wire.hpp).  `capture` copies this window's hand-off rows -
+    /// `[R][bo][inj]`, the same three the multi-GPU split passes - into the frame's storage; `apply`
+    /// copies a frame's rows back into this verifier's buffers before a window runs.  A stage of a split
+    /// in its own process uses these instead of the `hand_out_`/`hand_in_` pointers, which only work
+    /// when both stages share an address space.
+    bool boundary_capture(BoundaryFrame& f, int64_t T, int64_t pos0, void* stream, std::string& err) const;
+    bool boundary_apply(const BoundaryFrame& f, int64_t T, void* stream, std::string& err);
     /// DFlash2 (before init): keep the completed outputs of these layers (zero-based; the mean of the hc streams) for every row of
     /// each window in a device buffer, tap_dev() = [max_t][n_taps][n_embd] floats, valid until the next window.  Single-stage
     /// verifiers only; STRATA_TAP_FILE (research dump) turns the same buffer on without this call.
