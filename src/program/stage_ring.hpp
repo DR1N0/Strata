@@ -2,6 +2,7 @@
 #pragma once
 #include "strata/core/boundary_socket.hpp"
 #include "strata/core/boundary_wire.hpp"
+#include <chrono>
 #include <cstdio>
 #include <functional>
 #include <fstream>
@@ -18,10 +19,23 @@ struct StageRingConfig {
     std::vector<int64_t> eos_ids;
     bool stop_eos = true;
 };
+// Per-stage accounting for ONE request. Prompt positions and decode positions are counted apart because a stage's
+// cost per position is what a caller compares against another split; the transport's byte and time totals are what
+// tells bandwidth from latency. `experts_streamed` and `file_read_bytes` are filled by the compute callback, which
+// owns the engine's counters - this header cannot see them.
+struct StageRingStats {
+    int64_t positions = 0, prompt_positions = 0;
+    double compute_ms = 0, net_send_ms = 0, net_recv_ms = 0;
+    int64_t net_out_bytes = 0, net_in_bytes = 0;
+    int64_t experts_streamed = 0, file_read_bytes = 0;
+};
 // Compute one real model position, including prompt positions. Nonzero stages MUST consume input.
 using StageRingCompute = std::function<bool(const core::BoundaryFrame*, int32_t, int64_t,
                                            core::BoundaryFrame&, std::string&)>;
-inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& compute, std::string& err) {
+// `stats` may be null. When it is not, the run prints one RDONE line at exit, including on failure, so a caller can
+// tell a slow stage from a stage that never finished.
+inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& compute, StageRingStats* stats,
+                           std::string& err) {
     using namespace core;
     const bool head = c.lo == 0, tail = c.hi == c.layers;
     if (c.listen.empty() || c.downstream.empty() || (head && c.orch.empty())) {
@@ -49,15 +63,43 @@ inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& com
             out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
             if (!out) { err = "ring: boundary trace write failed"; return false; }
         }
-        return s.send_frame(bytes, err);
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!s.send_frame(bytes, err)) return false;
+        if (stats) {
+            stats->net_send_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            stats->net_out_bytes += (int64_t) bytes.size();
+        }
+        return true;
     };
     auto receive = [&](BoundarySocket& s, BoundaryFrame& f) {
         std::vector<uint8_t> bytes;
-        if (!s.recv_frame(bytes, err, size_t(256) << 20) ||
-            !boundary_deserialize(bytes.data(), bytes.size(), f, err)) return false;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!s.recv_frame(bytes, err, size_t(256) << 20)) return false;
+        if (stats) {
+            stats->net_recv_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            stats->net_in_bytes += (int64_t) bytes.size();
+        }
+        if (!boundary_deserialize(bytes.data(), bytes.size(), f, err)) return false;
         if (f.model_fingerprint != c.fingerprint) { err = "ring: model identity mismatch"; return false; }
         return true;
     };
+    // Printed from the destructor so every exit - including every early error - leaves one machine-readable line.
+    struct StatsPrinter {
+        const StageRingStats* s; int64_t lo, hi; bool completed = false;
+        ~StatsPrinter() {
+            if (!s) return;
+            std::fprintf(stderr,
+                         "RDONE lo=%lld hi=%lld status=%s positions=%lld prompt_positions=%lld compute_ms=%.1f "
+                         "net_send_ms=%.1f net_recv_ms=%.1f net_out_bytes=%lld net_in_bytes=%lld "
+                         "experts_streamed=%lld file_read_bytes=%lld\n",
+                         (long long) lo, (long long) hi, completed ? "ok" : "aborted",
+                         (long long) s->positions, (long long) s->prompt_positions, s->compute_ms,
+                         s->net_send_ms, s->net_recv_ms, (long long) s->net_out_bytes,
+                         (long long) s->net_in_bytes, (long long) s->experts_streamed,
+                         (long long) s->file_read_bytes);
+            std::fflush(stderr);
+        }
+    } printer{stats, c.lo, c.hi};
     auto control = [&](uint16_t kind) {
         BoundaryFrame f; f.kind = kind; f.rows = 1; f.model_fingerprint = c.fingerprint;
         f.stage_begin = c.lo; f.stage_end = c.hi; return f;
@@ -99,6 +141,7 @@ inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& com
             if (!receive(upstream, input)) return false;
             if (input.kind == kBoundaryEnd) {
                 if (!send(downstream, input)) return false;
+                printer.completed = true;
                 return true;
             }
             if ((input.kind != kBoundaryRows && input.kind != kBoundaryPrompt) ||
@@ -107,7 +150,14 @@ inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& com
             }
             token = input.next_token[0];
         }
+        const auto compute_t0 = std::chrono::steady_clock::now();
         if (!compute(head ? nullptr : &input, token, pos, output, err)) return false;
+        if (stats) {
+            stats->compute_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compute_t0).count();
+            ++stats->positions;
+            if (pos < n_prompt - 1) ++stats->prompt_positions;
+        }
         output.model_fingerprint = c.fingerprint; output.pos0 = pos; output.rows = 1;
         output.stage_begin = c.lo; output.stage_end = c.hi;
         output.kind = tail ? kBoundaryToken : (pos < n_prompt - 1 ? kBoundaryPrompt : kBoundaryRows);
@@ -137,6 +187,7 @@ inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& com
                     BoundaryFrame done;
                     if (!receive(upstream, done) || done.kind != kBoundaryEnd || !send(orch, end)) return false;
                     std::fprintf(stderr, "ring: complete, %lld tokens\n", (long long)emitted);
+                    printer.completed = true;
                     return true;
                 }
             } else token = request.next_token[(size_t)pos + 1];

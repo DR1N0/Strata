@@ -26,7 +26,14 @@ int main() {
             } else output.next_token[0] = token + 1;
             return true;
         };
-        success[i] = strata::program::stage_ring_run(c, fake, errors[i]);
+        strata::program::StageRingStats stats;
+        success[i] = strata::program::stage_ring_run(c, fake, &stats, errors[i]);
+        // A stage that ran must have counted its own positions and moved bytes; a stage that never reached the loop
+        // (the deadlock guards) leaves both at zero, which is what an aborted RDONE line reports.
+        if (success[i] && (stats.positions < 1 || stats.prompt_positions > stats.positions || stats.net_out_bytes < 1)) {
+            success[i] = false;
+            errors[i] = "stage 3: the run did not account for its positions and bytes";
+        }
     });
     BoundarySocket result, request;
     bool ok = listener.accept_one(result, err) && result.set_timeouts(5000, 5000, err);

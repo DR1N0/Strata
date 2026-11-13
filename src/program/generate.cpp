@@ -20132,10 +20132,14 @@ int main(int argc, char** argv) {
             g.n_layers, g.n_embd, g.hc, g.n_expert, g.n_expert_used, ring_identity.c_str());
         rc.eos_ids = o.eos_ids; rc.stop_eos = o.stop_eos;
         kvg_start(xcache.slots());
+        // Filled by both sides of the callback: the transport times and bytes are the ring's, the expert and file
+        // counters belong to this stage's engine, which knows its own residency answer.
+        strata::program::StageRingStats ring_stats;
         auto compute_ring = [&](const strata::core::BoundaryFrame* input, int32_t token, int64_t pos,
                                 strata::core::BoundaryFrame& output, std::string& re) -> bool {
             if (token < 0 || token >= g.n_vocab) { re = "ring: invalid input token"; return false; }
             if (!kvg_ensure(pos + 64, [] { cudaDeviceSynchronize(); })) { re = "ring: KV capacity failed"; return false; }
+            const uint64_t ring_fb0 = src.file_read_bytes();
             if (o.stage_begin > 0) {
                 if (!input) { re = "ring: nonzero stage requires boundary input"; return false; }
                 const auto* r = input->find("R"); const auto* b = input->find("bo"); const auto* inj = input->find("inj");
@@ -20155,9 +20159,11 @@ int main(int argc, char** argv) {
             if (o.stage_end < g.n_layers) {
                 if (!ring_ver.boundary_capture(output, 1, pos, main_cs, re)) return false;
             } else output.next_token[0] = sampled;
+            ring_stats.experts_streamed += drive.d.experts;
+            ring_stats.file_read_bytes += (int64_t) (src.file_read_bytes() - ring_fb0);
             return ring_ver.commit(1, re);
         };
-        const bool ok = strata::program::stage_ring_run(rc, compute_ring, err);
+        const bool ok = strata::program::stage_ring_run(rc, compute_ring, &ring_stats, err);
         if (!ok) std::fprintf(stderr, "ring: %s\n", err.c_str());
         return ok ? 0 : 1;
     }
