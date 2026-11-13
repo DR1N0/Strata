@@ -17,6 +17,7 @@
 #include "ref_quant.h"
 #include "arena_budget.h"
 #include "stream.h"
+#include "stage.h"
 #include "geo.h"
 #include "msl_libs.h"
 #include "../../tests/coop_probe.h"
@@ -240,6 +241,18 @@ class Window {
 public:
     bool init(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const std::string& shard1, int max_t,
               int64_t max_cells, std::string& err);
+    bool set_stage(int lo, int hi, const float* in, float* out, std::string& err) {
+        StagePlan plan;
+        if (!plan.configure(lo, hi, G_NL, G_QI, in != nullptr, err)) return false;
+        if (ready() && (plan.begin != stage_.begin || plan.end != stage_.end)) {
+            err = "metal stage: cannot change an initialized window's range"; return false;
+        }
+        stage_ = plan; hand_in_ = in; hand_out_ = out;
+        return true;
+    }
+    bool last_stage() const { return stage_.last(); }
+    bool boundary_capture(float* r, float* bo, float* inj, int t, int64_t pos, std::string& err) const;
+    bool boundary_apply(const float* r, const float* bo, const float* inj, int t, std::string& err);
     bool run(int T, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err);
     bool commit(int n_keep, std::string& err);
     bool finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, double t0);
@@ -373,6 +386,11 @@ private:
         return it->second;
     }
 
+    StagePlan stage_{0, G_NL, G_NL};
+    const float* hand_in_ = nullptr;
+    float* hand_out_ = nullptr;
+    bool boundary_ready_ = false, boundary_applied_ = false;
+    int64_t boundary_pos_ = -1;
     strata::core::SessionState* ss_ = nullptr;        // the session whose sequence the live state is (the main one, or a batch slot's)
     strata::core::SessionState* main_ss_ = nullptr;   // the main session: it owns the PLE table (read by every slot)
     gguf::File f_;
@@ -543,8 +561,10 @@ public:
     int win_n_[MAXT + 1] = {};
     double win_ms_[MAXT + 1] = {}, win_gpu_[MAXT + 1] = {};
     void at_cut(int s) {
-        st_->at_layer(s, seg_T_, TOPK, cut_ids_ ? cut_ids_ : ids_.as<int32_t>(), st_pred_ && !cut_ids_ ? predL_.as<float>() + (size_t) s * MAXT * 512 : nullptr,
-                      predL2_.ptr && !cut_ids_ ? predL2_.as<float>() + (size_t) s * MAXT * 512 : nullptr);
+        const int l = stage_.stream_layer(s);
+        st_->at_layer(l, seg_T_, TOPK, cut_ids_ ? cut_ids_ : ids_.as<int32_t>(),
+                      st_pred_ && !cut_ids_ && l + 1 < stage_.end ? predL_.as<float>() + (size_t) l * MAXT * 512 : nullptr,
+                      predL2_.ptr && !cut_ids_ && l + 2 < stage_.end ? predL2_.as<float>() + (size_t) l * MAXT * 512 : nullptr);
     }
 private:
     std::vector<float> ple_hist_;    // NG_HIST x hc_dim normalized rows, row-fastest
@@ -925,7 +945,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
                         for (int c = nexp_; c < NEXP; ++c) pb->as<float>()[r * 512 + c] = -INFINITY;
         }
     }
-    ple_on_ = ss.ple.ready() && f_.find("blk.1.ple_key.weight") != nullptr;
+    ple_on_ = stage_.first() && stage_.end > 1 && ss.ple.ready() && f_.find("blk.1.ple_key.weight") != nullptr;
     if (ple_on_ && T("blk.1.ple_conv1d.weight").type == ref::F32) {
         const gguf::Tensor& k = T("blk.1.ple_conv1d.weight");
         const size_t ne = k.bytes / 4;
@@ -1215,11 +1235,11 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     const gguf::Tensor& trt = T(b + "ffn_gate_inp.weight");
     gemv(ds, trt, XF_, logits_, 512, ntok);
     nb_ = true;
-    if (stream_ && st_pred_ && l + 1 < G_NL) {   // the next layer's routing guessed from this layer's FFN input
+    if (stream_ && st_pred_ && l + 1 < stage_.end) {   // the next layer's routing guessed from this layer's FFN input
         nb_ = true;   // beside the router GEMV
         gemv(ds, T("blk." + std::to_string(l + 1) + ".ffn_gate_inp.weight"), XF_, predL_, 512, ntok,
              (size_t) l * MAXT * 512 * 4);
-        if (predL2_.ptr && l + 2 < G_NL) {
+        if (predL2_.ptr && l + 2 < stage_.end) {
             nb_ = true;
             gemv(ds, T("blk." + std::to_string(l + 2) + ".ffn_gate_inp.weight"), XF_, predL2_, 512, ntok,
                  (size_t) l * MAXT * 512 * 4);
@@ -1409,11 +1429,42 @@ void Window::ple_cpu(int Tn) {
     }
 }
 
+bool Window::boundary_capture(float* r, float* bo, float* inj, int t, int64_t pos, std::string& err) const {
+    if (!boundary_ready_ || t != 1 || pos != boundary_pos_) {
+        err = "metal boundary: no matching completed intermediate T=1 window"; return false;
+    }
+    std::memcpy(r, R_.ptr, (size_t) HC * N * sizeof(float));
+    std::memcpy(bo, bo_.ptr, (size_t) N * sizeof(float));
+    std::memcpy(inj, inj_[0].ptr, (size_t) HC * sizeof(float));
+    return true;
+}
+bool Window::boundary_apply(const float* r, const float* bo, const float* inj, int t, std::string& err) {
+    if (!ready() || stage_.first() || t != 1) {
+        err = "metal boundary: apply requires an initialized non-first T=1 stage"; return false;
+    }
+    std::memcpy(R_.ptr, r, (size_t) HC * N * sizeof(float));
+    std::memcpy(bo_.ptr, bo, (size_t) N * sizeof(float));
+    std::memcpy(inj_[0].ptr, inj, (size_t) HC * sizeof(float));
+    boundary_applied_ = true;
+    boundary_ready_ = false;
+    return true;
+}
+
 bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err) {
     mtp_src_ = nullptr;
     if (Tn < 1 || Tn > MAXT || (head && Tn > max_t_)) { err = "metal window: window size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal window: the window runs past the context"; return false; }
+    if (!stage_.window(Tn, rows_, err)) return false;
+    boundary_ready_ = false;
+    head = head && stage_.last();
     const double t0 = now_ms();
+    // A non-first stage consumes the preceding FFN write as well as R. Both
+    // injection buffers start at parity zero, matching graph construction/cache.
+    if (!stage_.first()) {
+        if (!boundary_applied_)
+            stage_import(hand_in_, R_.as<float>(), bo_.as<float>(), inj_[0].as<float>(), Tn, N, HC);
+        boundary_applied_ = false;
+    } else {
     // ---- the embeddings (CPU dequant of the token rows straight into the shared buffer), broadcast to the streams
     const gguf::Tensor& te = T("token_embd.weight");
     const size_t rb = ref::row_bytes(te.type, N);
@@ -1422,6 +1473,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         if (const float* img = img_row(pos0 + t)) std::memcpy(r, img, (size_t) N * 4);
         else ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
         for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
+    }
     }
     // ---- the PLE rows (the table read is the shared host code's), projected on the GPU
     if (ple_on_) {
@@ -1496,7 +1548,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         gemv(ds, T("blk.1.ple_value.weight"), XE_, pval_, N, Tn);
     }
     cur_inj_ = 0;
-    layer(ds, 0, Tn, pos0);
+    layer(ds, stage_.begin, Tn, pos0);
     if (ple_on_) {
         // layer 0's FFN write applied to R (gr_norm with apply writes R back; its xn is not used)
         const gguf::Tensor& tn = T("blk.1.hc_attn_norm.weight");
@@ -1534,9 +1586,10 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         g4.grid[0] = HC * N / 256; g4.grid[1] = Tn; g4.tg[0] = 256;
         push(ds, g4);
     }
-    for (int l = 1; l < G_NL; ++l) layer(ds, l, Tn, pos0);
-    // ---- the final mixer and the head
-    gr_read(ds, "output_hc", true, XA_, true, Tn);
+    for (int l = stage_.begin + 1; l < stage_.end; ++l) layer(ds, l, Tn, pos0);
+    // Do NOT fold the last pending FFN on an intermediate stage. Its successor's
+    // first gr_read performs that fold, exactly as in the unsplit chain.
+    if (stage_.last()) gr_read(ds, "output_hc", true, XA_, true, Tn);
     if (head) gemv(ds, T("output.weight"), XA_, lm_, (size_t) n_vocab_, Tn);
     if (head) {
         ArgArgs a{(uint32_t) n_vocab_, 120};
@@ -1985,6 +2038,13 @@ void Window::print_prof(bool periodic) {
 }
 
 bool Window::finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, double t0) {
+    if (!stage_.last()) {
+        // run_graph has waited for completion; these buffers are shared memory.
+        boundary_ready_ = true;
+        boundary_pos_ = pos0;
+        if (hand_out_)
+            stage_export(hand_out_, R_.as<float>(), bo_.as<float>(), inj_[0].as<float>(), Tn, N, HC);
+    }
     ++win_n_[Tn];
     win_ms_[Tn] += now_ms() - t0;
     win_gpu_[Tn] += last_gpu_ms_;
@@ -2123,6 +2183,7 @@ void Window::alloc_set(SeqSet& o, bool real, int idx) {
 }
 
 bool Window::slots_init(const std::vector<strata::core::SessionState*>& slots, std::string& err) {
+    if (stage_.split()) { err = "metal stage: batch slots are not supported by L0"; return false; }
     if (!sets_.empty()) return true;   // (asked once)
     if (cx_ == nullptr) { err = "metal window: slots before the window is up"; return false; }
     std::vector<std::unique_ptr<SeqSet>> v;
@@ -2272,9 +2333,9 @@ static void bind_qsa(strata::core::QsaState& st, const mtl::Buffer& kq, const mt
 void Window::bind_session(strata::core::SessionState& ss) {
     if (!ss.qsa_states) return;
     const int64_t n = ss.qsa_alloc, o = ss.qsa_ord0;
-    if (n != (int64_t) kq_.size() || o != 0) return;   // a carved session: not this window's whole model
-    for (int64_t j = 0; j < n; ++j)
-        bind_qsa(ss.qsa_states[(size_t) (o + j)], kq_[(size_t) j], vq_[(size_t) j], ksc_[(size_t) j], vsc_[(size_t) j],
+    if (o < 0 || n < 0 || o + n > (int64_t) kq_.size()) return;
+    for (int64_t j = o; j < o + n; ++j)
+        bind_qsa(ss.qsa_states[(size_t) j], kq_[(size_t) j], vq_[(size_t) j], ksc_[(size_t) j], vsc_[(size_t) j],
                  &pooled_[(size_t) j], &tail_[(size_t) j], &dead_[(size_t) j], max_cells_);
 }
 
@@ -2315,6 +2376,8 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
 }
 
 void Window::reset() {
+    boundary_ready_ = boundary_applied_ = false;
+    boundary_pos_ = -1;
     pend_fold_ = 0;
     last_T_ = 0;
     auto zero = [](const mtl::Buffer& b, size_t n) { std::memset(b.ptr, 0, n); };
@@ -2397,6 +2460,7 @@ bool Window::commit(int n_keep, std::string& err) {
 
 // ================================================================================================ the MTP draft layer
 bool Window::mtp_load(const std::string& gguf_path, int max_t, std::string& err) {
+    if (stage_.split()) { err = "metal stage: MTP is not supported by L0"; return false; }
     (void) max_t;
     if (!fm_.open(gguf_path, err)) return false;
     madvise(fm_.map, fm_.map_bytes, MADV_WILLNEED);
@@ -3522,6 +3586,15 @@ void window_destroy(void* w) {
         window_register(nullptr);
     }
 }
+bool window_set_stage(void* w, int lo, int hi, const float* in, float* out, std::string& err) {
+    return ((Window*) w)->set_stage(lo, hi, in, out, err);
+}
+bool window_boundary_capture(void* w, float* r, float* bo, float* inj, int t, int64_t pos, std::string& err) {
+    return ((Window*) w)->boundary_capture(r, bo, inj, t, pos, err);
+}
+bool window_boundary_apply(void* w, const float* r, const float* bo, const float* inj, int t, std::string& err) {
+    return ((Window*) w)->boundary_apply(r, bo, inj, t, err);
+}
 bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::SessionState& ss, int max_t, int64_t max_cells,
                  int64_t* n_vocab, std::string& err) {
     Window* x = (Window*) w;
@@ -3550,8 +3623,9 @@ bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, 
     // windows that sample nothing (head_sampling off)
     static const bool logpos = std::getenv("STRATA_LOGPOS") != nullptr;
     Window* win = (Window*) w;
-    if (!win->run(T, tokens, pos0, head || logpos, out, err)) return false;
-    return !head || win->sample_rows(T, out, err);   // a sampled / penalised / biased request: the head rows' tokens by the sampler chain (nothing to do for greedy)
+    const bool sample = head && win->last_stage();
+    if (!win->run(T, tokens, pos0, (head || logpos) && win->last_stage(), out, err)) return false;
+    return !sample || win->sample_rows(T, out, err);   // a sampled / penalised / biased request: the head rows' tokens by the sampler chain (nothing to do for greedy)
 }
 void window_reset(const strata::core::SessionState* ss) {
     if (g_the_window == nullptr || !g_the_window->ready()) return;

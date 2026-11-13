@@ -93,6 +93,9 @@
 namespace strata::metal_engine {
 void window_destroy(void* w);
 void* window_create();
+bool window_set_stage(void* w, int lo, int hi, const float* in, float* out, std::string& err);
+bool window_boundary_capture(void* w, float* r, float* bo, float* inj, int t, int64_t pos, std::string& err);
+bool window_boundary_apply(void* w, const float* r, const float* bo, const float* inj, int t, std::string& err);
 bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::SessionState& ss, int max_t, int64_t max_cells,
                  int64_t* n_vocab, std::string& err);
 bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err);
@@ -899,7 +902,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
 #if defined(STRATA_GPU_METAL)
+    if (le_ < 0) le_ = g.n_layers;
     if (metal_ == nullptr) metal_ = strata::metal_engine::window_create();
+    if (!strata::metal_engine::window_set_stage(metal_, (int) lb_, (int) le_, hand_in_, hand_out_, err)) return false;
     if (!strata::metal_engine::window_init(metal_, g, ss, max_t, ss.qsa_states[ss.qsa_primary()].max_cells, &n_vocab_, err)) return false;
     if (!tap_req_.empty()) {   // DFlash2: the Metal window writes the taps itself (metal/src/engine/dflash2.inc); tap_dev() is its unified-memory buffer
         const float* tp = nullptr;
@@ -5472,6 +5477,19 @@ void Verifier::absorb_stats(Verifier& o) {
 // so a consumer takes the one it needs rather than guessing a stride.
 
 bool Verifier::boundary_capture(BoundaryFrame& f, int64_t T, int64_t pos0, void* stream, std::string& err) const {
+#if defined(STRATA_GPU_METAL)
+    (void) stream;
+    if (!g_ || !metal_ || T != 1 || le_ >= g_->n_layers) {
+        err = "boundary_capture: Metal needs an intermediate T=1 stage"; return false;
+    }
+    const int64_t N = g_->n_embd, HC = g_->hc;
+    if (!boundary_frame_alloc(f, T, {"R", "bo", "inj"}, {HC * N, N, HC})) {
+        err = "boundary_capture: bad window shape"; return false;
+    }
+    f.pos0 = pos0; f.stage_begin = lb_; f.stage_end = le_;
+    return strata::metal_engine::window_boundary_capture(metal_, f.storage.data(), f.storage.data() + HC * N,
+                                                       f.storage.data() + (HC + 1) * N, (int) T, pos0, err);
+#else
     if (g_ == nullptr || R_ == nullptr || bo_ == nullptr || inj2_ == nullptr) {
         err = "boundary_capture: the verifier is not initialized";
         return false;
@@ -5499,9 +5517,22 @@ bool Verifier::boundary_capture(BoundaryFrame& f, int64_t T, int64_t pos0, void*
         return false;
     }
     return true;
+#endif
 }
 
 bool Verifier::boundary_apply(const BoundaryFrame& f, int64_t T, void* stream, std::string& err) {
+#if defined(STRATA_GPU_METAL)
+    (void) stream;
+    if (!g_ || !metal_ || T != 1 || lb_ <= 0 || f.stage_end != lb_) {
+        err = "boundary_apply: Metal needs a contiguous incoming T=1 frame"; return false;
+    }
+    const BoundaryTensor *r = f.find("R"), *b = f.find("bo"), *i = f.find("inj");
+    if (!r || !b || !i || !r->host || !b->host || !i->host || r->rows != T || b->rows != T || i->rows != T ||
+        r->elems_per_row != g_->hc * g_->n_embd || b->elems_per_row != g_->n_embd || i->elems_per_row != g_->hc) {
+        err = "boundary_apply: the frame's tensors do not fit this verifier"; return false;
+    }
+    return strata::metal_engine::window_boundary_apply(metal_, r->host, b->host, i->host, (int) T, err);
+#else
     if (g_ == nullptr || R_ == nullptr || bo_ == nullptr || inj2_ == nullptr) {
         err = "boundary_apply: the verifier is not initialized";
         return false;
@@ -5527,6 +5558,7 @@ bool Verifier::boundary_apply(const BoundaryFrame& f, int64_t T, void* stream, s
         return false;
     }
     return true;
+#endif
 }
 
 }  // namespace strata::core
