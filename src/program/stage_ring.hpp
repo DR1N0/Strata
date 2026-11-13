@@ -18,6 +18,7 @@ struct StageRingConfig {
     uint64_t fingerprint = 0;
     std::vector<int64_t> eos_ids;
     bool stop_eos = true;
+    int64_t max_requests = 1;   // 1 keeps the single-shot behaviour; >1 serves that many requests before exiting
 };
 // Per-stage accounting for ONE request. Prompt positions and decode positions are counted apart because a stage's
 // cost per position is what a caller compares against another split; the transport's byte and time totals are what
@@ -32,10 +33,13 @@ struct StageRingStats {
 // Compute one real model position, including prompt positions. Nonzero stages MUST consume input.
 using StageRingCompute = std::function<bool(const core::BoundaryFrame*, int32_t, int64_t,
                                            core::BoundaryFrame&, std::string&)>;
+// Called once before each request's first position: put this stage's sequence state back to a fresh document.
+// session_zero covers R, GDN recurrence, QSA cache and the PLE history; the K/V position counters are the caller's.
+using StageRingReset = std::function<bool(std::string&)>;
 // `stats` may be null. When it is not, the run prints one RDONE line at exit, including on failure, so a caller can
 // tell a slow stage from a stage that never finished.
-inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& compute, StageRingStats* stats,
-                           std::string& err) {
+inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& compute, const StageRingReset& reset,
+                           StageRingStats* stats, std::string& err) {
     using namespace core;
     const bool head = c.lo == 0, tail = c.hi == c.layers;
     if (c.listen.empty() || c.downstream.empty() || (head && c.orch.empty())) {
@@ -111,88 +115,100 @@ inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& com
     if (!head && !send(downstream, ready)) return false;
     if (head && !send(orch, ready)) return false;
     std::fprintf(stderr, "ring: ready\n");
-    BoundaryFrame request;
-    if (head) {
-        BoundarySocket client;
-        if (!listener.accept_one(client, err)) return false;
-        std::vector<uint8_t> bytes;
-        if (!client.recv_frame(bytes, err, size_t(4) << 20) ||
-            !boundary_deserialize(bytes.data(), bytes.size(), request, err)) return false;
-        if (request.kind != kBoundaryRequest || request.rows < 1 || request.pos0 < 1 ||
-            request.rows + request.pos0 > c.max_context) {
-            err = "ring: invalid request or context capacity exceeded"; return false;
-        }
-        request.kind = kBoundaryStart; request.model_fingerprint = c.fingerprint;
-        if (!send(downstream, request)) return false;
-        BoundaryFrame echoed;
-        if (!receive(upstream, echoed) || echoed.kind != kBoundaryStart) return false;
-    } else {
-        if (!receive(upstream, request) || request.kind != kBoundaryStart || !send(downstream, request)) return false;
-    }
-    const int64_t n_prompt = request.rows, max_new = request.pos0;
-    if (n_prompt < 1 || max_new < 1 || n_prompt + max_new > c.max_context) {
-        err = "ring: invalid START capacity"; return false;
-    }
-    int64_t pos = 0, emitted = 0;
-    int32_t token = request.next_token[0];
+    // ONE ITERATION IS ONE REQUEST. The READY trip and the orchestrator's token connection are set up once and
+    // outlive the loop; only the REQUEST handshake is repeated. `reset` must put this stage's sequence state back
+    // to a fresh document (session_zero covers R, GDN recurrence, QSA cache and the PLE history); without it a
+    // second request would convolve over the first one's rows and still produce plausible tokens.
+    int64_t served = 0;
     for (;;) {
-        BoundaryFrame input, output;
-        if (!head) {
-            if (!receive(upstream, input)) return false;
-            if (input.kind == kBoundaryEnd) {
-                if (!send(downstream, input)) return false;
-                printer.completed = true;
-                return true;
-            }
-            if ((input.kind != kBoundaryRows && input.kind != kBoundaryPrompt) ||
-                input.rows != 1 || input.pos0 != pos || input.stage_end != c.lo) {
-                err = "ring: wrong message kind, position, row count, or adjacent layer range"; return false;
-            }
-            token = input.next_token[0];
-        }
-        const auto compute_t0 = std::chrono::steady_clock::now();
-        if (!compute(head ? nullptr : &input, token, pos, output, err)) return false;
-        if (stats) {
-            stats->compute_ms +=
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compute_t0).count();
-            ++stats->positions;
-            if (pos < n_prompt - 1) ++stats->prompt_positions;
-        }
-        output.model_fingerprint = c.fingerprint; output.pos0 = pos; output.rows = 1;
-        output.stage_begin = c.lo; output.stage_end = c.hi;
-        output.kind = tail ? kBoundaryToken : (pos < n_prompt - 1 ? kBoundaryPrompt : kBoundaryRows);
-        if (tail && pos >= n_prompt - 1) {
-            bool finished = pos - (n_prompt - 1) + 1 >= max_new;
-            for (auto eos : c.eos_ids) if (c.stop_eos && output.next_token[0] == eos) finished = true;
-            if (finished) output.kind = kBoundaryEnd; // Tail owns sampling and reports its completion decision.
-        }
-        if (!tail) output.next_token[0] = token; // INPUT token, never an uninitialized prediction.
-        if (!send(downstream, output)) return false;
+        BoundaryFrame request;
         if (head) {
-            BoundaryFrame result;
-            if (!receive(upstream, result) || (result.kind != kBoundaryToken && result.kind != kBoundaryEnd) ||
-                result.pos0 != pos || result.rows != 1) {
-                err = "ring: expected token for current position"; return false;
+            BoundarySocket client;
+            if (!listener.accept_one(client, err)) return false;
+            std::vector<uint8_t> bytes;
+            if (!client.recv_frame(bytes, err, size_t(4) << 20) ||
+                !boundary_deserialize(bytes.data(), bytes.size(), request, err)) return false;
+            if (request.kind != kBoundaryRequest || request.rows < 1 || request.pos0 < 1 ||
+                request.rows + request.pos0 > c.max_context) {
+                err = "ring: invalid request or context capacity exceeded"; return false;
             }
-            if (pos >= n_prompt - 1) {
-                ++emitted;
-                const bool stop = result.kind == kBoundaryEnd;
-                result.kind = kBoundaryToken; // Stream the final sampled token before the separate completion event.
-                if (!send(orch, result)) return false;
-                std::fprintf(stderr, "ring: token %d at position %lld\n", result.next_token[0], (long long)pos);
-                token = result.next_token[0];
-                if (stop) {
-                    auto end = control(kBoundaryEnd); end.pos0 = pos + 1;
-                    if (!send(downstream, end)) return false;
-                    BoundaryFrame done;
-                    if (!receive(upstream, done) || done.kind != kBoundaryEnd || !send(orch, end)) return false;
-                    std::fprintf(stderr, "ring: complete, %lld tokens\n", (long long)emitted);
-                    printer.completed = true;
-                    return true;
-                }
-            } else token = request.next_token[(size_t)pos + 1];
+            request.kind = kBoundaryStart; request.model_fingerprint = c.fingerprint;
+            if (!send(downstream, request)) return false;
+            BoundaryFrame echoed;
+            if (!receive(upstream, echoed) || echoed.kind != kBoundaryStart) return false;
+        } else {
+            if (!receive(upstream, request) || request.kind != kBoundaryStart || !send(downstream, request)) return false;
         }
-        ++pos;
+        const int64_t n_prompt = request.rows, max_new = request.pos0;
+        if (n_prompt < 1 || max_new < 1 || n_prompt + max_new > c.max_context) {
+            err = "ring: invalid START capacity"; return false;
+        }
+        if (reset && !reset(err)) return false;
+        int64_t pos = 0, emitted = 0;
+        int32_t token = request.next_token[0];
+        bool request_finished = false;
+        while (!request_finished) {
+            BoundaryFrame input, output;
+            if (!head) {
+                if (!receive(upstream, input)) return false;
+                if (input.kind == kBoundaryEnd) {
+                    if (!send(downstream, input)) return false;
+                    request_finished = true;   // the ring's END is the request's end, not the process's
+                    continue;
+                }
+                if ((input.kind != kBoundaryRows && input.kind != kBoundaryPrompt) ||
+                    input.rows != 1 || input.pos0 != pos || input.stage_end != c.lo) {
+                    err = "ring: wrong message kind, position, row count, or adjacent layer range"; return false;
+                }
+                token = input.next_token[0];
+            }
+            const auto compute_t0 = std::chrono::steady_clock::now();
+            if (!compute(head ? nullptr : &input, token, pos, output, err)) return false;
+            if (stats) {
+                stats->compute_ms +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compute_t0).count();
+                ++stats->positions;
+                if (pos < n_prompt - 1) ++stats->prompt_positions;
+            }
+            output.model_fingerprint = c.fingerprint; output.pos0 = pos; output.rows = 1;
+            output.stage_begin = c.lo; output.stage_end = c.hi;
+            output.kind = tail ? kBoundaryToken : (pos < n_prompt - 1 ? kBoundaryPrompt : kBoundaryRows);
+            if (tail && pos >= n_prompt - 1) {
+                bool last = pos - (n_prompt - 1) + 1 >= max_new;
+                for (auto eos : c.eos_ids) if (c.stop_eos && output.next_token[0] == eos) last = true;
+                if (last) output.kind = kBoundaryEnd; // Tail owns sampling and reports its completion decision.
+            }
+            if (!tail) output.next_token[0] = token; // INPUT token, never an uninitialized prediction.
+            if (!send(downstream, output)) return false;
+            if (head) {
+                BoundaryFrame result;
+                if (!receive(upstream, result) || (result.kind != kBoundaryToken && result.kind != kBoundaryEnd) ||
+                    result.pos0 != pos || result.rows != 1) {
+                    err = "ring: expected token for current position"; return false;
+                }
+                if (pos >= n_prompt - 1) {
+                    ++emitted;
+                    const bool stop = result.kind == kBoundaryEnd;
+                    result.kind = kBoundaryToken; // Stream the final sampled token before the separate completion event.
+                    if (!send(orch, result)) return false;
+                    std::fprintf(stderr, "ring: token %d at position %lld\n", result.next_token[0], (long long)pos);
+                    token = result.next_token[0];
+                    if (stop) {
+                        auto end = control(kBoundaryEnd); end.pos0 = pos + 1;
+                        if (!send(downstream, end)) return false;
+                        BoundaryFrame done;
+                        if (!receive(upstream, done) || done.kind != kBoundaryEnd || !send(orch, end)) return false;
+                        std::fprintf(stderr, "ring: complete, %lld tokens\n", (long long)emitted);
+                        request_finished = true;
+                    }
+                } else token = request.next_token[(size_t)pos + 1];
+            }
+            ++pos;
+        }
+        ++served;
+        if (served >= c.max_requests) break;
     }
+    printer.completed = true;
+    return true;
 }
 } // namespace strata::program

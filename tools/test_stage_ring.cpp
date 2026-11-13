@@ -27,7 +27,8 @@ int main() {
             return true;
         };
         strata::program::StageRingStats stats;
-        success[i] = strata::program::stage_ring_run(c, fake, &stats, errors[i]);
+        const strata::program::StageRingReset no_reset;   // the fake holds no sequence state
+        success[i] = strata::program::stage_ring_run(c, fake, no_reset, &stats, errors[i]);
         // A stage that ran must have counted its own positions and moved bytes; a stage that never reached the loop
         // (the deadlock guards) leaves both at zero, which is what an aborted RDONE line reports.
         if (success[i] && (stats.positions < 1 || stats.prompt_positions > stats.positions || stats.net_out_bytes < 1)) {

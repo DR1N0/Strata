@@ -624,6 +624,7 @@ struct Options {
     std::string stage_listen;    ///< --listen PORT: this stage's ingress (bind + accept)
     std::string stage_downstream;///< --downstream HOST:PORT: where this stage sends its rows (or its token)
     std::string stage_orch;      ///< --orch HOST:PORT: the head's tokens for the request's driver
+    int64_t stage_requests = 1;  ///< --max-requests N: serve N requests before exiting (1 = the single-shot run)
     std::string stage_output;   ///< where this stage writes its output residual
     bool greedy = true;
     uint64_t seed = 0;
@@ -3447,6 +3448,7 @@ int main(int argc, char** argv) {
         else if (a == "--listen") o.stage_listen = next("--listen");
         else if (a == "--downstream") o.stage_downstream = next("--downstream");
         else if (a == "--orch") o.stage_orch = next("--orch");
+        else if (a == "--max-requests") o.stage_requests = std::atoll(next("--max-requests"));
         else if (a == "--stage-output") o.stage_output = next("--stage-output");
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
@@ -20131,10 +20133,23 @@ int main(int argc, char** argv) {
         rc.fingerprint = strata::core::boundary_model_fingerprint(
             g.n_layers, g.n_embd, g.hc, g.n_expert, g.n_expert_used, ring_identity.c_str());
         rc.eos_ids = o.eos_ids; rc.stop_eos = o.stop_eos;
+        rc.max_requests = o.stage_requests > 0 ? o.stage_requests : 1;
         kvg_start(xcache.slots());
         // Filled by both sides of the callback: the transport times and bytes are the ring's, the expert and file
         // counters belong to this stage's engine, which knows its own residency answer.
         strata::program::StageRingStats ring_stats;
+        // Between two requests this stage must forget the last document. session_zero covers R, the GDN recurrence,
+        // the QSA cache and the PLE history; the elastic K/V hands its cells back the same way a fresh run starts.
+        // A stage that skipped this would convolve request 2's first rows with request 1's, and the output would
+        // still look like text.
+        auto reset_ring = [&](std::string& re) -> bool {
+            strata::core::session_zero(ss, g, nullptr, main_cs);
+            if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
+                re = "ring: session reset did not synchronize"; return false;
+            }
+            kvg_start(xcache.slots());
+            return true;
+        };
         auto compute_ring = [&](const strata::core::BoundaryFrame* input, int32_t token, int64_t pos,
                                 strata::core::BoundaryFrame& output, std::string& re) -> bool {
             if (token < 0 || token >= g.n_vocab) { re = "ring: invalid input token"; return false; }
@@ -20163,7 +20178,7 @@ int main(int argc, char** argv) {
             ring_stats.file_read_bytes += (int64_t) (src.file_read_bytes() - ring_fb0);
             return ring_ver.commit(1, re);
         };
-        const bool ok = strata::program::stage_ring_run(rc, compute_ring, &ring_stats, err);
+        const bool ok = strata::program::stage_ring_run(rc, compute_ring, reset_ring, &ring_stats, err);
         if (!ok) std::fprintf(stderr, "ring: %s\n", err.c_str());
         return ok ? 0 : 1;
     }
