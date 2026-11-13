@@ -87,22 +87,25 @@ inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& com
         if (f.model_fingerprint != c.fingerprint) { err = "ring: model identity mismatch"; return false; }
         return true;
     };
-    // Printed from the destructor so every exit - including every early error - leaves one machine-readable line.
+    // One RDONE per completed request, carrying the running totals: request k's own cost is the difference
+    // between rows k and k-1, which keeps a resident worker's numbers separable without a second channel.
+    // A stage that dies before serving anything still leaves its line, with req=-1 and status=aborted.
     struct StatsPrinter {
-        const StageRingStats* s; int64_t lo, hi; bool completed = false;
-        ~StatsPrinter() {
+        const StageRingStats* s; int64_t lo, hi; bool reported = false;
+        void line(int64_t request, const char* status) const {
             if (!s) return;
             std::fprintf(stderr,
-                         "RDONE lo=%lld hi=%lld status=%s positions=%lld prompt_positions=%lld compute_ms=%.1f "
-                         "net_send_ms=%.1f net_recv_ms=%.1f net_out_bytes=%lld net_in_bytes=%lld "
+                         "RDONE req=%lld lo=%lld hi=%lld status=%s positions=%lld prompt_positions=%lld "
+                         "compute_ms=%.1f net_send_ms=%.1f net_recv_ms=%.1f net_out_bytes=%lld net_in_bytes=%lld "
                          "experts_streamed=%lld file_read_bytes=%lld\n",
-                         (long long) lo, (long long) hi, completed ? "ok" : "aborted",
+                         (long long) request, (long long) lo, (long long) hi, status,
                          (long long) s->positions, (long long) s->prompt_positions, s->compute_ms,
                          s->net_send_ms, s->net_recv_ms, (long long) s->net_out_bytes,
                          (long long) s->net_in_bytes, (long long) s->experts_streamed,
                          (long long) s->file_read_bytes);
             std::fflush(stderr);
         }
+        ~StatsPrinter() { if (!reported) line(-1, "aborted"); }
     } printer{stats, c.lo, c.hi};
     auto control = [&](uint16_t kind) {
         BoundaryFrame f; f.kind = kind; f.rows = 1; f.model_fingerprint = c.fingerprint;
@@ -205,10 +208,11 @@ inline bool stage_ring_run(const StageRingConfig& c, const StageRingCompute& com
             }
             ++pos;
         }
+        printer.line(served, "ok");
+        printer.reported = true;
         ++served;
         if (served >= c.max_requests) break;
     }
-    printer.completed = true;
     return true;
 }
 } // namespace strata::program
