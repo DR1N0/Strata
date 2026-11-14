@@ -553,6 +553,9 @@ public:
     bool prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err);
     int prompt_chunk_rows() const;
     float* prompt_rows_ptr();
+    // The prompt entry points are free functions, so the stage's handoff rows are published through this and not
+    // through friendship: one pointer in, cleared on the way out.
+    void set_prompt_hand(const float* h) { prompt_hand_ = h; }
     // The rows of the last window this object ran (R_), for the fallback prompt path that steps MAXT at a time.
     float* window_rows_ptr() { return R_.as<float>(); }
     void prompt_region(bool hold) { if (stream_ && st_ && st_->ready()) st_->hold_region(hold); }
@@ -3737,8 +3740,8 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
     // window, and threading one more argument through prompt()/pc_chunk()/prompt_chunk() would add three signatures
     // for one pointer. Cleared on every exit.
     struct Hand {
-        explicit Hand(const float* h) { g_window->prompt_hand_ = h; }
-        ~Hand() { g_window->prompt_hand_ = nullptr; }
+        explicit Hand(const float* h) { g_window->set_prompt_hand(h); }
+        ~Hand() { g_window->set_prompt_hand(nullptr); }
     } hand(hand_rows);
     return prompt_run_rows(tokens, n, pos0, hand_rows, on_chunk, err);
 }
