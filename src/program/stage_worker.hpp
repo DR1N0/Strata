@@ -98,7 +98,9 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
             ++stats->positions;
             if (in.kind == kBoundaryPrompt) ++stats->prompt_positions;
         }
-        out.kind = kBoundaryRows;
+        // Carry the prompt/decode distinction downstream: a stage that reported every position as decode would
+        // make any prefill accounting wrong, and the difference travels only in the kind.
+        out.kind = in.kind == kBoundaryPrompt ? kBoundaryPrompt : kBoundaryRows;
         out.pos0 = in.pos0;
         out.rows = 1;
         out.stage_begin = c.lo;
