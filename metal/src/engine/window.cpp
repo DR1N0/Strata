@@ -390,6 +390,9 @@ private:
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
     bool boundary_ready_ = false, boundary_applied_ = false;
+    // Set for the duration of a prompt run: this stage's handoff input, n rows (null on the entry stage). The decode
+    // path's one-row `hand_in_` cannot carry a chunk.
+    const float* prompt_hand_ = nullptr;
     int64_t boundary_pos_ = -1;
     strata::core::SessionState* ss_ = nullptr;        // the session whose sequence the live state is (the main one, or a batch slot's)
     strata::core::SessionState* main_ss_ = nullptr;   // the main session: it owns the PLE table (read by every slot)
@@ -3143,8 +3146,8 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             else ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
             for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
         }
-    } else if (hand_in_ != nullptr) {
-        std::memcpy(p.R.as<float>(), hand_in_, (size_t) T * HC * N * sizeof(float));
+    } else if (prompt_hand_ != nullptr) {
+        std::memcpy(p.R.as<float>(), prompt_hand_, (size_t) T * HC * N * sizeof(float));
     } else {
         err = "metal prompt: a non-entry stage has no handoff rows"; return false;
     }
@@ -3721,16 +3724,26 @@ bool mtp_load_pending(Window* w, std::string& err) {
 // Prefill::run's Metal side: the prompt read through the window, MAXT rows at a time (no head), each window
 // committed; on_chunk (the MTP's K/V) after each, with the window's final residual rows in place.
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
+                const float* hand_rows,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
 bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
+                const float* hand_rows,
                 const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     struct Rows {
         explicit Rows(const float* const* r) { g_embd_rows = r; }
         ~Rows() { g_embd_rows = nullptr; }
     } rows(embd_rows);
-    return prompt_run_rows(tokens, n, pos0, on_chunk, err);
+    // The stage's handoff rows are held here for the duration of the prompt: every chunk function already reads the
+    // window, and threading one more argument through prompt()/pc_chunk()/prompt_chunk() would add three signatures
+    // for one pointer. Cleared on every exit.
+    struct Hand {
+        explicit Hand(const float* h) { g_window->prompt_hand_ = h; }
+        ~Hand() { g_window->prompt_hand_ = nullptr; }
+    } hand(hand_rows);
+    return prompt_run_rows(tokens, n, pos0, hand_rows, on_chunk, err);
 }
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
+                const float* hand_rows,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
     static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";

@@ -188,7 +188,11 @@ void down(const Layer&, void*) {}
 namespace strata::metal_engine {
 bool window_ensure(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, int64_t max_cells, std::string& err);
 bool prompt_taps(const std::vector<int>& layers, int64_t first_pos, const std::function<bool(const float*, int64_t, int64_t, std::string&)>& cb, std::string& err);   // dflash2.inc
+// `hand_rows` is this stage's handoff input: n rows of hc*n_embd, tensor-major, when the stage does not own layer
+// 0. Null for the entry stage. Passing it here rather than through the window's one-row decode buffer is what lets
+// a prompt chunk cross a boundary at all.
 bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
+                const float* hand_rows,
                 const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
 }  // namespace strata::metal_engine
 #endif
@@ -7948,7 +7952,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // DFlash2: the window writes the taps of the prompt rows at positions >= tap_first_ and hands them to on_taps after each chunk
         const bool taps = !tap_layers_.empty() && on_taps;
         if (taps && !strata::metal_engine::prompt_taps(tap_layers_, tap_first_, on_taps, err)) return false;
-        const bool ok = strata::metal_engine::prompt_run(tokens, n, pos0, embd_rows, on_chunk, err);
+        const bool ok = strata::metal_engine::prompt_run(tokens, n, pos0, embd_rows, hand_in_, on_chunk, err);
         if (taps) {
             std::string off_err;
             strata::metal_engine::prompt_taps(tap_layers_, 0, {}, off_err);   // no callback after the prompt

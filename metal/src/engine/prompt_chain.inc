@@ -253,8 +253,8 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             else std::memcpy(r, cur.emb.data() + (size_t) t * N, (size_t) N * 4);
             for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
         }
-    } else if (hand_in_ != nullptr) {
-        std::memcpy(b.R.as<float>(), hand_in_, (size_t) nT * HC * N * sizeof(float));
+    } else if (prompt_hand_ != nullptr) {
+        std::memcpy(b.R.as<float>(), prompt_hand_, (size_t) nT * HC * N * sizeof(float));
     } else {
         err = "metal prompt: a non-entry stage has no handoff rows"; return false;
     }
