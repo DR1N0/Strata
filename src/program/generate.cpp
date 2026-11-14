@@ -20128,6 +20128,60 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ring: verifier init: %s\n", err.c_str()); return 1;
         }
         ring_ver.set_sampling(sp);
+        // THE PROMPT PATH FOR THIS STAGE. `Verifier::run` tops out at kWindowMaxT (8-16 rows) because that is a
+        // decode window, so a prompt cannot go through it without degenerating to one position per frame. Prefill
+        // is the engine's chunked reader: given the whole prompt it walks it in chunks and hands each chunk's rows
+        // over, which is the only shape whose cost tracks chunks instead of tokens.
+        strata::prefill::Prefill ring_prefill;
+        ring_prefill.set_cpu_pool(&pool);
+        ring_prefill.set_stage(o.stage_begin, o.stage_end >= g.n_layers ? -1 : o.stage_end, nullptr);
+        // No borrowed buffers: the loan machinery exists to fit a prompt's temporary rows inside the expert cache,
+        // and borrowing is the part of the single-machine path most entangled with per-run planning. Until this
+        // path is measured, the conservative own-buffer form is the one worth trusting.
+        const int64_t ring_chunk = o.prefill_chunk > 0 ? o.prefill_chunk : 512;
+        if (!ring_prefill.init(wt, g, ss, srcp, &xcache, host_res.empty() ? nullptr : host_res.data(),
+                               ring_chunk, main_cs, err, nullptr, 0, false)) {
+            std::fprintf(stderr, "stage: prefill init: %s\n", err.c_str()); return 1;
+        }
+        const int64_t ring_hc_n = (int64_t) g.hc * g.n_embd;
+        auto prefill_stage = [&](const strata::core::BoundaryFrame& in,
+                                 std::vector<strata::core::BoundaryFrame>& out, std::string& pe) -> bool {
+            const int64_t n = in.rows;
+            std::vector<int64_t> toks(in.next_token.begin(), in.next_token.end());
+            toks.resize((size_t) n, 0);
+            std::vector<float> rows;                       // every row this stage produces, handoff layout
+            if (o.stage_begin > 0) {                       // this stage starts from its predecessor's rows
+                const strata::core::BoundaryTensor* r = in.find("R");
+                if (r == nullptr || r->rows != n || r->elems_per_row != ring_hc_n) {
+                    pe = "stage: the prompt frame carries no usable R for this stage"; return false;
+                }
+                rows.assign(r->host, r->host + r->floats());
+                ring_prefill.set_hand_in(rows.data());
+            }
+            std::vector<float> produced;
+            ring_prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                const size_t at = produced.size();
+                produced.resize(at + (size_t) T * (size_t) ring_hc_n);
+                if (cudaMemcpy(produced.data() + at, R_rows, (size_t) T * (size_t) ring_hc_n * sizeof(float),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    e = "stage: the chunk copy failed"; return false;
+                }
+                return true;
+            };
+            const bool ok = ring_prefill.run(toks.data(), n, in.pos0, pe);
+            ring_prefill.on_chunk = nullptr;
+            if (!ok) return false;
+            if (o.stage_end < g.n_layers) {                // hand this stage's rows to the next stage
+                strata::core::BoundaryFrame frame;
+                if (!strata::core::boundary_frame_alloc(frame, n, {"R", "bo", "inj"},
+                                                        {ring_hc_n, g.n_embd, g.hc})) { pe = "stage: bad shape"; return false; }
+                frame.pos0 = in.pos0;
+                frame.next_token.assign(in.next_token.begin(), in.next_token.begin() + (std::ptrdiff_t) n);
+                std::memcpy(frame.storage.data(), produced.data(), produced.size() * sizeof(float));
+                out.push_back(std::move(frame));
+            }
+            return true;
+        };
         std::string ring_identity;
         for (const auto& shard : o.native_shards)
             ring_identity += std::filesystem::path(shard).filename().string() + ";";
@@ -20200,7 +20254,8 @@ int main(int argc, char** argv) {
             filebytes_out = &worker_stats.file_read_bytes;
             strata::program::StageWorkerConfig wc;
             wc.agent = o.stage_agent; wc.lo = o.stage_begin; wc.hi = o.stage_end;
-            ok = strata::program::stage_worker_run(wc, compute_stage, reset_stage, &worker_stats, err);
+            ok = strata::program::stage_worker_run(wc, compute_stage, reset_stage, prefill_stage,
+                                                   &worker_stats, err);
         } else {
             ok = strata::program::stage_ring_run(rc, compute_stage, reset_stage, &ring_stats, err);
         }

@@ -32,8 +32,15 @@ using StageWorkerCompute = std::function<bool(const core::BoundaryFrame* input, 
 // Called when a position 0 arrives, which is how a new request starts. session_zero covers R, the GDN recurrence,
 // the QSA cache and the PLE history; an engine that skipped this would convolve request 2's rows with request 1's.
 using StageWorkerReset = std::function<bool(std::string&)>;
+// The prompt path. Given the whole prompt it computes every position in chunked batches and hands back one frame
+// per chunk, carrying that chunk's `R` rows. This exists because a position-at-a-time prompt is not a design
+// choice: a real 100K prompt would be 100K chain round-trips, and the engine's own chunked reader (Prefill) is
+// what makes the cost proportional to chunks rather than to tokens.
+using StageWorkerPrefill = std::function<bool(const core::BoundaryFrame& in,
+                                              std::vector<core::BoundaryFrame>& out, std::string& err)>;
 inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerCompute& compute,
-                             const StageWorkerReset& reset, StageWorkerStats* stats, std::string& err) {
+                             const StageWorkerReset& reset, const StageWorkerPrefill& prefill,
+                             StageWorkerStats* stats, std::string& err) {
     using namespace core;
     BoundarySocket link;
     std::string host;
@@ -68,6 +75,23 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
     for (;;) {
         BoundaryFrame in;
         if (!receive(in)) return false;
+        // A prompt frame carries the whole prompt, so the chunking is the engine's rather than the wire's.
+        if (prefill && in.kind == kBoundaryPrompt && in.rows > 1) {
+            if (in.pos0 == 0) {
+                if (stats) ++stats->requests;
+                if (reset && !reset(err)) return false;
+            }
+            std::vector<BoundaryFrame> frames;
+            if (!prefill(in, frames, err)) return false;
+            for (auto& f : frames) {
+                f.kind = kBoundaryPrompt;          // the same prompt rows, chunk by chunk
+                f.stage_begin = c.lo;
+                f.stage_end = c.hi;
+                if (!send(f)) return false;
+            }
+            if (stats) { stats->positions += in.rows; stats->prompt_positions += in.rows; }
+            continue;
+        }
         if (in.kind == kBoundaryEnd) {
             // END closes one request, not the engine: a resident stage serves the next request without reloading.
             if (stats) {
