@@ -20621,6 +20621,7 @@ int main(int argc, char** argv) {
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
+        const uint64_t pf_fb0 = src.file_read_bytes();     // how much of the prompt path actually came off disk
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -20655,6 +20656,9 @@ int main(int argc, char** argv) {
         prefill.clear_taps();
 #endif
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
+        std::fprintf(stderr, "strata generate: prompt path read %.2f GB from disk, moved %.2f GB to the device\n",
+                     (double) (src.file_read_bytes() - pf_fb0) / 1e9,
+                     (double) prefill.stats().experts_streamed * (double) strata::kernels::cpu::expert_layout().max_blob / 1e9);
         prefill_ms += prefill_batched_ms;
         mem_mark("the prompt was read");
         pos_start = n_batched;
