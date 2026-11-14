@@ -254,7 +254,9 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
         }
     } else if (prompt_hand_ != nullptr) {
-        std::memcpy(b.R.as<float>(), prompt_hand_, (size_t) nT * HC * N * sizeof(float));
+        // The chunk's own slice of the prompt's rows; see prompt_chunk. Base + pos0 rows.
+        std::memcpy(b.R.as<float>(), prompt_hand_ + (size_t) pos0 * (size_t) HC * N,
+                    (size_t) nT * HC * N * sizeof(float));
     } else {
         err = "metal prompt: a non-entry stage has no handoff rows"; return false;
     }

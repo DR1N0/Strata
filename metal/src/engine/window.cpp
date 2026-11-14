@@ -3150,7 +3150,11 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
         }
     } else if (prompt_hand_ != nullptr) {
-        std::memcpy(p.R.as<float>(), prompt_hand_, (size_t) T * HC * N * sizeof(float));
+        // THE CHUNK'S OWN SLICE. prompt_hand_ holds the whole prompt's rows from position 0, so chunk at pos0 reads
+        // from pos0 rows in - copying from the base every time would make every chunk start with the first chunk's
+        // tokens, which is wrong for any prompt longer than one chunk.
+        std::memcpy(p.R.as<float>(), prompt_hand_ + (size_t) pos0 * (size_t) HC * N,
+                    (size_t) T * HC * N * sizeof(float));
     } else {
         err = "metal prompt: a non-entry stage has no handoff rows"; return false;
     }
