@@ -9,6 +9,7 @@
 #include "strata/core/boundary_wire.hpp"
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
@@ -55,8 +56,17 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
     BoundarySocket link;
     std::string host;
     int port = 0;
-    if (!boundary_parse_address(c.agent, host, port, err) || !link.connect_to(host, port, 120000, err)) return false;
-    if (!link.set_timeouts(120000, 120000, err)) return false;
+    // The socket timeout is the idle window, not the request's duration: a stage that has nothing to do yet must
+    // sit still until the entry stage's prompt arrives. 120 s was measured to be too short on a 4K prompt (the
+    // head's prefill alone is ~45 s and the tail had already given up), and a longer prompt is worse. The default
+    // is now 10 minutes; STRATA_STAGE_IDLE_TIMEOUT_MS overrides it for a caller that wants a tighter leash.
+    int idle_ms = 600000;
+    if (const char* e = std::getenv("STRATA_STAGE_IDLE_TIMEOUT_MS")) {
+        const int v = std::atoi(e);
+        if (v > 0) idle_ms = v;
+    }
+    if (!boundary_parse_address(c.agent, host, port, err) || !link.connect_to(host, port, idle_ms, err)) return false;
+    if (!link.set_timeouts(idle_ms, idle_ms, err)) return false;
     std::fprintf(stderr, "worker: linked to the agent at %s, layers [%lld,%lld)\n", c.agent.c_str(),
                  (long long) c.lo, (long long) c.hi);
 
