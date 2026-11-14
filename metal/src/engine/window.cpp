@@ -3126,8 +3126,14 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         pend_fold_ = 0;
     }
     const int T = Tn;
-    // ---- the embeddings into every stream, the PLE rows
-    {
+    // A window that was never given a stage is a whole-model window: stage_ defaults to an empty range, and reading
+    // it literally would silently compute zero layers. Anything that did not call set_stage keeps the old behaviour.
+    const bool staged = stage_.layers > 0;
+    const int LB = staged ? stage_.begin : 0;
+    const int LE = staged ? stage_.end : G_NL;
+    // ---- the rows: this stage's entry point. Only the stage that owns layer 0 embeds tokens; every other stage
+    // continues from the residual rows its predecessor handed over, one row per token.
+    if (LB == 0) {
         const gguf::Tensor& te = TN("token_embd.weight");
         const size_t rb = ref::row_bytes(te.type, N);
         mrope_sync(pos0, T);
@@ -3137,9 +3143,15 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             else ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
             for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
         }
+    } else if (hand_in_ != nullptr) {
+        std::memcpy(p.R.as<float>(), hand_in_, (size_t) T * HC * N * sizeof(float));
+    } else {
+        err = "metal prompt: a non-entry stage has no handoff rows"; return false;
     }
+    // PLE belongs to the stage that owns layer 1.
+    const bool ple_here = ple_on_ && LB <= 1 && 1 < LE;
     strata::core::SessionState& ss = *ss_;
-    if (ple_on_) {
+    if (ple_here) {
         std::vector<uint32_t> rows((size_t) T * strata::kernels::PLE_N_HEADS);
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
@@ -3204,7 +3216,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         ci = 1 - ci;
     };
     // the PLE projections (the window's gemv pair as GEMMs)
-    if (ple_on_) {
+    if (ple_here) {
         act16(p.emb, p.embh, (size_t) T * N);
         dq(TN("blk.1.ple_key.weight"), p.Wpk);
         dq(TN("blk.1.ple_value.weight"), p.Wpv);
@@ -3213,7 +3225,8 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     }
     const int MB = (int) max_cells_ / 4 + 2;
     (void) MB;
-    for (int l = 0; l < G_NL; ++l) {
+    // THIS STAGE'S LAYERS ONLY: see pc_chunk above. The rows handed out below are what the next stage continues from.
+    for (int l = LB; l < LE; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
         hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_));
         if (l % 4 != 3) {
