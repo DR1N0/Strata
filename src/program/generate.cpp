@@ -57,6 +57,7 @@
 #include "strata/core/boundary_wire.hpp"
 #include "strata/core/boundary_socket.hpp"
 #include "stage_ring.hpp"
+#include "stage_worker.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -624,6 +625,8 @@ struct Options {
     std::string stage_listen;    ///< --listen PORT: this stage's ingress (bind + accept)
     std::string stage_downstream;///< --downstream HOST:PORT: where this stage sends its rows (or its token)
     std::string stage_orch;      ///< --orch HOST:PORT: the head's tokens for the request's driver
+    std::string stage_agent;     ///< --agent HOST:PORT: the local agent; the engine then listens on nothing and
+                                 ///< knows no topology - the agent owns routing
     int64_t stage_requests = 1;  ///< --max-requests N: serve N requests before exiting (1 = the single-shot run)
     std::string stage_output;   ///< where this stage writes its output residual
     bool greedy = true;
@@ -3448,6 +3451,7 @@ int main(int argc, char** argv) {
         else if (a == "--listen") o.stage_listen = next("--listen");
         else if (a == "--downstream") o.stage_downstream = next("--downstream");
         else if (a == "--orch") o.stage_orch = next("--orch");
+        else if (a == "--agent") o.stage_agent = next("--agent");
         else if (a == "--max-requests") o.stage_requests = std::atoll(next("--max-requests"));
         else if (a == "--stage-output") o.stage_output = next("--stage-output");
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
@@ -20100,7 +20104,7 @@ int main(int argc, char** argv) {
 
     // Network workers use one explicit ring state machine, not two autonomous speculative loops.
     // T=1 includes prompt positions: a correctness baseline; batched prefill is a later optimization.
-    if (!o.stage_listen.empty()) {
+    if (!o.stage_agent.empty() || !o.stage_listen.empty()) {
         if (multi_gpu || o.stage_end < 0 || !o.stage_input.empty()) {
             std::fprintf(stderr, "ring: explicit stage range required; local multi-GPU/file input not supported\n");
             return 2;
@@ -20138,11 +20142,15 @@ int main(int argc, char** argv) {
         // Filled by both sides of the callback: the transport times and bytes are the ring's, the expert and file
         // counters belong to this stage's engine, which knows its own residency answer.
         strata::program::StageRingStats ring_stats;
+        strata::program::StageWorkerStats worker_stats;
+        // The engine's own counters go wherever the active path keeps them; the compute callback cannot know which.
+        int64_t* experts_out = &ring_stats.experts_streamed;
+        int64_t* filebytes_out = &ring_stats.file_read_bytes;
         // Between two requests this stage must forget the last document. session_zero covers R, the GDN recurrence,
         // the QSA cache and the PLE history; the elastic K/V hands its cells back the same way a fresh run starts.
         // A stage that skipped this would convolve request 2's first rows with request 1's, and the output would
         // still look like text.
-        auto reset_ring = [&](std::string& re) -> bool {
+        auto reset_stage = [&](std::string& re) -> bool {
             strata::core::session_zero(ss, g, nullptr, main_cs);
             if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
                 re = "ring: session reset did not synchronize"; return false;
@@ -20150,7 +20158,7 @@ int main(int argc, char** argv) {
             kvg_start(xcache.slots());
             return true;
         };
-        auto compute_ring = [&](const strata::core::BoundaryFrame* input, int32_t token, int64_t pos,
+        auto compute_stage = [&](const strata::core::BoundaryFrame* input, int32_t token, int64_t pos,
                                 strata::core::BoundaryFrame& output, std::string& re) -> bool {
             if (token < 0 || token >= g.n_vocab) { re = "ring: invalid input token"; return false; }
             if (!kvg_ensure(pos + 64, [] { cudaDeviceSynchronize(); })) { re = "ring: KV capacity failed"; return false; }
@@ -20173,13 +20181,30 @@ int main(int argc, char** argv) {
             }
             if (o.stage_end < g.n_layers) {
                 if (!ring_ver.boundary_capture(output, 1, pos, main_cs, re)) return false;
-            } else output.next_token[0] = sampled;
-            ring_stats.experts_streamed += drive.d.experts;
-            ring_stats.file_read_bytes += (int64_t) (src.file_read_bytes() - ring_fb0);
+                // The next stage needs the token THIS position consumed. A stage with the lm head sends the
+                // sampled token instead. Either way the frame carries exactly one token.
+                if (output.next_token.size() < 1) output.next_token.assign(1, token);
+                else output.next_token[0] = token;
+            } else {
+                if (output.next_token.size() < 1) output.next_token.assign(1, sampled);
+                else output.next_token[0] = sampled;
+            }
+            *experts_out += drive.d.experts;
+            *filebytes_out += (int64_t) (src.file_read_bytes() - ring_fb0);
             return ring_ver.commit(1, re);
         };
-        const bool ok = strata::program::stage_ring_run(rc, compute_ring, reset_ring, &ring_stats, err);
-        if (!ok) std::fprintf(stderr, "ring: %s\n", err.c_str());
+        bool ok = false;
+        if (!o.stage_agent.empty()) {
+            // The mesh form: this engine links to its local agent, listens on nothing, and knows no topology.
+            experts_out = &worker_stats.experts_streamed;
+            filebytes_out = &worker_stats.file_read_bytes;
+            strata::program::StageWorkerConfig wc;
+            wc.agent = o.stage_agent; wc.lo = o.stage_begin; wc.hi = o.stage_end;
+            ok = strata::program::stage_worker_run(wc, compute_stage, reset_stage, &worker_stats, err);
+        } else {
+            ok = strata::program::stage_ring_run(rc, compute_stage, reset_stage, &ring_stats, err);
+        }
+        if (!ok) std::fprintf(stderr, "stage: %s\n", err.c_str());
         return ok ? 0 : 1;
     }
 
