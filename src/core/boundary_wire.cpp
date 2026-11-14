@@ -2,7 +2,7 @@
 //
 // boundary_wire.cpp - the frame's serialization.  See boundary_wire.hpp for why it exists.
 //
-// The wire layout (little-endian, packed, no padding), version 4:
+// The wire layout (little-endian, packed, no padding), version 3 (kBoundaryVersion):
 //
 //   u32 magic | u16 version | u16 kind | u16 n_tensors | u64 model_fingerprint
 //   i64 pos0  | i64 rows    | i64 stage_begin | i64 stage_end
