@@ -25,6 +25,11 @@ struct StageWorkerStats {
     double compute_ms = 0, net_send_ms = 0, net_recv_ms = 0;
     int64_t net_out_bytes = 0, net_in_bytes = 0;
     int64_t experts_streamed = 0, file_read_bytes = 0;
+    // The prompt path's own numbers, kept apart from the decode counters: a prompt is where the wall clock went in
+    // the 20K run, and without these the only evidence was a total that nobody could attribute.
+    double prefill_ms = 0;
+    int64_t prefill_tokens = 0, prefill_chunks = 0, prefill_experts = 0, prefill_resident = 0;
+    double prefill_host_ms = 0;
 };
 // `input` is null exactly for a stage that owns the embedding (lo == 0): that stage starts from a token alone.
 using StageWorkerCompute = std::function<bool(const core::BoundaryFrame* input, int32_t token, int64_t pos,
@@ -32,12 +37,17 @@ using StageWorkerCompute = std::function<bool(const core::BoundaryFrame* input, 
 // Called when a position 0 arrives, which is how a new request starts. session_zero covers R, the GDN recurrence,
 // the QSA cache and the PLE history; an engine that skipped this would convolve request 2's rows with request 1's.
 using StageWorkerReset = std::function<bool(std::string&)>;
-// The prompt path. Given the whole prompt it computes every position in chunked batches and hands back one frame
-// per chunk, carrying that chunk's `R` rows. This exists because a position-at-a-time prompt is not a design
-// choice: a real 100K prompt would be 100K chain round-trips, and the engine's own chunked reader (Prefill) is
-// what makes the cost proportional to chunks rather than to tokens.
-using StageWorkerPrefill = std::function<bool(const core::BoundaryFrame& in,
-                                              std::vector<core::BoundaryFrame>& out, std::string& err)>;
+// The prompt path. Given the whole prompt it computes every position in chunked batches and hands each chunk over
+// AS IT FINISHES, through `emit`. Emitting per chunk is not an optimisation: a 20K prompt's rows are about a
+// gigabyte, so collecting them into one frame would exceed both the wire's payload bound and any sane receive
+// buffer. This exists because a position-at-a-time prompt is not a design choice either - a real prompt would cost
+// one chain round-trip per token, while chunks make it proportional to chunks.
+using StageWorkerEmit = std::function<bool(core::BoundaryFrame&)>;
+// `hand_rows` is null for the entry stage, which owns the embedding; every other stage is handed the prompt's whole
+// row tensor, one row per token, in the same order.
+using StageWorkerPrefill = std::function<bool(const int32_t* tokens, int64_t n, int64_t pos0,
+                                              const float* hand_rows, int64_t hand_elems,
+                                              const StageWorkerEmit& emit, std::string& err)>;
 inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerCompute& compute,
                              const StageWorkerReset& reset, const StageWorkerPrefill& prefill,
                              StageWorkerStats* stats, std::string& err) {
@@ -72,24 +82,75 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         return boundary_deserialize(bytes.data(), bytes.size(), f, err);
     };
 
+    // A stage with an upstream cannot act on one chunk frame: its prompt path needs EVERY row before it runs,
+    // because those rows are one tensor in token order. So the upstream stage first sends the prompt itself (a
+    // header frame carrying all its tokens), then the chunk frames; this side accumulates until it has them all.
+    // An entry stage does the opposite: it receives the prompt and EMITS chunk frames as its prompt path runs.
+    int64_t pf_n = -1, pf_elems = 0;
+    std::vector<float> pf_rows;
+    std::vector<int32_t> pf_tokens;
     for (;;) {
         BoundaryFrame in;
         if (!receive(in)) return false;
+        if (prefill && in.kind == kBoundaryRequest) {
+            pf_tokens.assign(in.next_token.begin(), in.next_token.end());
+            pf_n = in.rows;
+            pf_rows.clear();
+            pf_elems = 0;
+            if (stats) ++stats->requests;
+            if (reset && !reset(err)) return false;
+            continue;
+        }
+        if (prefill && pf_n >= 0 && in.kind == kBoundaryPrompt && in.rows > 1) {
+            const BoundaryTensor* r = in.find("R");
+            if (r == nullptr || r->rows != in.rows || r->elems_per_row <= 0) {
+                err = "worker: a prompt chunk frame carries no usable R"; return false;
+            }
+            if (pf_elems == 0) pf_elems = r->elems_per_row;
+            pf_rows.insert(pf_rows.end(), r->host, r->host + r->floats());
+            if (stats) { stats->positions += r->rows; stats->prompt_positions += r->rows; }
+            if ((int64_t) pf_rows.size() / pf_elems < pf_n) continue;
+            const auto t0 = std::chrono::steady_clock::now();
+            const StageWorkerEmit no_emit = [](BoundaryFrame&) { return true; };
+            const bool ok = prefill(pf_tokens.data(), pf_n, 0, pf_rows.data(), pf_elems, no_emit, err);
+            if (stats) {
+                stats->prefill_ms +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                stats->prefill_tokens += pf_n;
+            }
+            pf_n = -1; pf_rows.clear(); pf_elems = 0;
+            if (!ok) return false;
+            // A stage that emits chunks implies completion by emitting them; a stage that accumulated them has to
+            // say so, or the agent has no way to know the prompt is done and the next frame is welcome.
+            if (c.lo > 0) {
+                BoundaryFrame ack;
+                ack.kind = kBoundaryReady;
+                ack.rows = 1;
+                if (!send(ack)) return false;
+            }
+            continue;
+        }
         // A prompt frame carries the whole prompt, so the chunking is the engine's rather than the wire's.
         if (prefill && in.kind == kBoundaryPrompt && in.rows > 1) {
             if (in.pos0 == 0) {
                 if (stats) ++stats->requests;
                 if (reset && !reset(err)) return false;
             }
-            std::vector<BoundaryFrame> frames;
-            if (!prefill(in, frames, err)) return false;
-            for (auto& f : frames) {
+            auto emit = [&](BoundaryFrame& f) {
                 f.kind = kBoundaryPrompt;          // the same prompt rows, chunk by chunk
                 f.stage_begin = c.lo;
                 f.stage_end = c.hi;
-                if (!send(f)) return false;
+                return send(f);
+            };
+            const auto t_prefill = std::chrono::steady_clock::now();
+            if (!prefill(in.next_token.data(), in.rows, in.pos0, nullptr, 0, emit, err)) return false;
+            if (stats) {
+                stats->positions += in.rows;
+                stats->prompt_positions += in.rows;
+                stats->prefill_ms +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_prefill).count();
+                stats->prefill_tokens += in.rows;
             }
-            if (stats) { stats->positions += in.rows; stats->prompt_positions += in.rows; }
             continue;
         }
         if (in.kind == kBoundaryEnd) {
@@ -98,12 +159,14 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 std::fprintf(stderr,
                              "WDONE requests=%lld lo=%lld hi=%lld positions=%lld prompt_positions=%lld "
                              "compute_ms=%.1f net_send_ms=%.1f net_recv_ms=%.1f net_out_bytes=%lld "
-                             "net_in_bytes=%lld experts_streamed=%lld file_read_bytes=%lld\n",
+                             "net_in_bytes=%lld experts_streamed=%lld file_read_bytes=%lld prefill_ms=%.1f prefill_tokens=%lld prefill_chunks=%lld prefill_experts=%lld prefill_resident=%lld prefill_host_ms=%.1f\n",
                              (long long) stats->requests, (long long) c.lo, (long long) c.hi,
                              (long long) stats->positions, (long long) stats->prompt_positions, stats->compute_ms,
                              stats->net_send_ms, stats->net_recv_ms, (long long) stats->net_out_bytes,
                              (long long) stats->net_in_bytes, (long long) stats->experts_streamed,
-                             (long long) stats->file_read_bytes);
+                             (long long) stats->file_read_bytes,
+                             stats->prefill_ms, (long long) stats->prefill_tokens, (long long) stats->prefill_chunks, (long long) stats->prefill_experts,
+                             (long long) stats->prefill_resident, stats->prefill_host_ms);
                 std::fflush(stderr);
             }
             continue;
@@ -135,11 +198,13 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         std::fprintf(stderr,
                      "WDONE requests=%lld lo=%lld hi=%lld positions=%lld prompt_positions=%lld compute_ms=%.1f "
                      "net_send_ms=%.1f net_recv_ms=%.1f net_out_bytes=%lld net_in_bytes=%lld "
-                     "experts_streamed=%lld file_read_bytes=%lld\n",
+                     "experts_streamed=%lld file_read_bytes=%lld prefill_ms=%.1f prefill_tokens=%lld prefill_chunks=%lld prefill_experts=%lld prefill_resident=%lld prefill_host_ms=%.1f\n",
                      (long long) stats->requests, (long long) c.lo, (long long) c.hi, (long long) stats->positions,
                      (long long) stats->prompt_positions, stats->compute_ms, stats->net_send_ms, stats->net_recv_ms,
                      (long long) stats->net_out_bytes, (long long) stats->net_in_bytes,
-                     (long long) stats->experts_streamed, (long long) stats->file_read_bytes);
+                     (long long) stats->experts_streamed, (long long) stats->file_read_bytes,
+                     stats->prefill_ms, (long long) stats->prefill_tokens, (long long) stats->prefill_chunks,
+                     (long long) stats->prefill_experts, (long long) stats->prefill_resident, stats->prefill_host_ms);
         std::fflush(stderr);
     }
     return true;

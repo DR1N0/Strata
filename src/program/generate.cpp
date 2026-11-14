@@ -20132,55 +20132,75 @@ int main(int argc, char** argv) {
         // decode window, so a prompt cannot go through it without degenerating to one position per frame. Prefill
         // is the engine's chunked reader: given the whole prompt it walks it in chunks and hands each chunk's rows
         // over, which is the only shape whose cost tracks chunks instead of tokens.
+        strata::program::StageWorkerStats worker_stats;
+        strata::program::StageRingStats ring_stats;
+        // The engine's own counters go wherever the active path keeps them; the compute callback cannot know which.
+        int64_t* experts_out = &ring_stats.experts_streamed;
+        int64_t* filebytes_out = &ring_stats.file_read_bytes;
         strata::prefill::Prefill ring_prefill;
         ring_prefill.set_cpu_pool(&pool);
         ring_prefill.set_stage(o.stage_begin, o.stage_end >= g.n_layers ? -1 : o.stage_end, nullptr);
         // No borrowed buffers: the loan machinery exists to fit a prompt's temporary rows inside the expert cache,
         // and borrowing is the part of the single-machine path most entangled with per-run planning. Until this
         // path is measured, the conservative own-buffer form is the one worth trusting.
-        const int64_t ring_chunk = o.prefill_chunk > 0 ? o.prefill_chunk : 512;
+        // COMPUTE IN BIG CHUNKS, SHIP IN SMALL FRAMES. These are two different limits and conflating them cost a
+        // 20K prompt about 100 seconds: chunking at 512 to fit the wire made Prefill pay its per-chunk overhead
+        // (expert table, synchronisation) forty times over. Prefill wants chunks large enough for that overhead to
+        // disappear; the wire wants frames small enough for the peer to buffer. So a 2048-row chunk is cut into
+        // 512-row frames on the way out.
+        const int64_t ring_chunk = 2048;
+        const int64_t ring_frame_rows = 512;
         if (!ring_prefill.init(wt, g, ss, srcp, &xcache, host_res.empty() ? nullptr : host_res.data(),
                                ring_chunk, main_cs, err, nullptr, 0, false)) {
             std::fprintf(stderr, "stage: prefill init: %s\n", err.c_str()); return 1;
         }
         const int64_t ring_hc_n = (int64_t) g.hc * g.n_embd;
-        auto prefill_stage = [&](const strata::core::BoundaryFrame& in,
-                                 std::vector<strata::core::BoundaryFrame>& out, std::string& pe) -> bool {
-            const int64_t n = in.rows;
-            std::vector<int64_t> toks(in.next_token.begin(), in.next_token.end());
-            toks.resize((size_t) n, 0);
-            std::vector<float> rows;                       // every row this stage produces, handoff layout
-            if (o.stage_begin > 0) {                       // this stage starts from its predecessor's rows
-                const strata::core::BoundaryTensor* r = in.find("R");
-                if (r == nullptr || r->rows != n || r->elems_per_row != ring_hc_n) {
-                    pe = "stage: the prompt frame carries no usable R for this stage"; return false;
-                }
-                rows.assign(r->host, r->host + r->floats());
-                ring_prefill.set_hand_in(rows.data());
+        auto prefill_stage = [&](const int32_t* tokens, int64_t n, int64_t pos0, const float* hand_rows,
+                                 int64_t hand_elems, const strata::program::StageWorkerEmit& emit,
+                                 std::string& pe) -> bool {
+            std::vector<int64_t> toks(tokens, tokens + n);
+            if (hand_rows != nullptr) {
+                if (hand_elems != ring_hc_n) { pe = "stage: the prompt rows are not this stage's shape"; return false; }
+                ring_prefill.set_hand_in(hand_rows);       // this stage starts from its predecessor's rows
+            } else if (o.stage_begin > 0) {
+                pe = "stage: a non-entry stage needs the prompt's rows"; return false;
             }
-            std::vector<float> produced;
+            // ONE FRAME PER CHUNK, CUT SMALLER IF NEEDED. Prefill wants chunks big enough that its per-chunk cost
+            // disappears; the wire wants frames small enough for the peer to buffer. Those are different limits.
             ring_prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
-                const size_t at = produced.size();
-                produced.resize(at + (size_t) T * (size_t) ring_hc_n);
-                if (cudaMemcpy(produced.data() + at, R_rows, (size_t) T * (size_t) ring_hc_n * sizeof(float),
-                               cudaMemcpyDeviceToHost) != cudaSuccess) {
-                    e = "stage: the chunk copy failed"; return false;
+                if (o.stage_end >= g.n_layers) return true;    // the last stage hands rows to nobody
+                for (int64_t at = 0; at < T; at += ring_frame_rows) {
+                    const int64_t rows = std::min(ring_frame_rows, T - at);
+                    strata::core::BoundaryFrame frame;
+                    if (!strata::core::boundary_frame_alloc(frame, rows, {"R", "bo", "inj"},
+                                                            {ring_hc_n, g.n_embd, g.hc})) {
+                        e = "stage: bad shape"; return false;
+                    }
+                    frame.pos0 = p0 + at;
+                    frame.next_token.resize((size_t) rows, -1);
+                    for (int64_t r = 0; r < rows; ++r) {
+                        const int64_t next_at = p0 + at + r + 1;
+                        frame.next_token[(size_t) r] =
+                            next_at < (int64_t) toks.size() ? (int32_t) toks[(size_t) next_at] : -1;
+                    }
+                    if (cudaMemcpy(frame.storage.data(), R_rows + (size_t) at * (size_t) ring_hc_n,
+                                   (size_t) rows * (size_t) ring_hc_n * sizeof(float),
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        e = "stage: the chunk copy failed"; return false;
+                    }
+                    if (!emit(frame)) return false;
                 }
                 return true;
             };
-            const bool ok = ring_prefill.run(toks.data(), n, in.pos0, pe);
+            const bool ok = ring_prefill.run(toks.data(), n, pos0, pe);
             ring_prefill.on_chunk = nullptr;
-            if (!ok) return false;
-            if (o.stage_end < g.n_layers) {                // hand this stage's rows to the next stage
-                strata::core::BoundaryFrame frame;
-                if (!strata::core::boundary_frame_alloc(frame, n, {"R", "bo", "inj"},
-                                                        {ring_hc_n, g.n_embd, g.hc})) { pe = "stage: bad shape"; return false; }
-                frame.pos0 = in.pos0;
-                frame.next_token.assign(in.next_token.begin(), in.next_token.begin() + (std::ptrdiff_t) n);
-                std::memcpy(frame.storage.data(), produced.data(), produced.size() * sizeof(float));
-                out.push_back(std::move(frame));
-            }
-            return true;
+            const auto& ps = ring_prefill.stats();
+            *experts_out += ps.experts_streamed;
+            worker_stats.prefill_chunks += ps.chunks;
+            worker_stats.prefill_experts += ps.experts_streamed;
+            worker_stats.prefill_resident += ps.experts_resident;
+            worker_stats.prefill_host_ms += ps.ms_experts_host;
+            return ok;
         };
         std::string ring_identity;
         for (const auto& shard : o.native_shards)
@@ -20195,11 +20215,6 @@ int main(int argc, char** argv) {
         kvg_start(xcache.slots());
         // Filled by both sides of the callback: the transport times and bytes are the ring's, the expert and file
         // counters belong to this stage's engine, which knows its own residency answer.
-        strata::program::StageRingStats ring_stats;
-        strata::program::StageWorkerStats worker_stats;
-        // The engine's own counters go wherever the active path keeps them; the compute callback cannot know which.
-        int64_t* experts_out = &ring_stats.experts_streamed;
-        int64_t* filebytes_out = &ring_stats.file_read_bytes;
         // Between two requests this stage must forget the last document. session_zero covers R, the GDN recurrence,
         // the QSA cache and the PLE history; the elastic K/V hands its cells back the same way a fresh run starts.
         // A stage that skipped this would convolve request 2's first rows with request 1's, and the output would
