@@ -581,7 +581,12 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
         if (on_chunk) {
             const double tm0 = now_ms();
             mpsrc_ = &pb_.R;   // the drafter's prompt rows are this chunk's final residuals
-            const bool ok = on_chunk(nullptr, nT, pos0 + c, err);
+            // HAND THE ROWS OUT. A stage that ends before the last layer must send this chunk's residuals to the
+            // next stage, and they are exactly what `pb_.R` holds: the final residual of every row in the chunk.
+            // Passing null here made a split stage unable to run a prompt at all, which is why this path was
+            // previously only usable whole. The pointer is the device one, as on the CUDA path, so a caller's
+            // cudaMemcpy means the same thing on both backends.
+            const bool ok = on_chunk(pb_.R.as<float>(), nT, pos0 + c, err);
             mpsrc_ = nullptr;
             if (mtp_async_) std::swap(pb_.R, pb_.R2);   // the drafter's rows are still reading this chunk's residuals: the next chunk writes the other
             pb_.mtp_ms += now_ms() - tm0;

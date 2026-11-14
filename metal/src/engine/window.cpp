@@ -549,6 +549,9 @@ public:
     bool prompt_gemm_init(std::string& err);
     bool prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err);
     int prompt_chunk_rows() const;
+    float* prompt_rows_ptr();
+    // The rows of the last window this object ran (R_), for the fallback prompt path that steps MAXT at a time.
+    float* window_rows_ptr() { return R_.as<float>(); }
     void prompt_region(bool hold) { if (stream_ && st_ && st_->ready()) st_->hold_region(hold); }
     void stream_report(FILE* f) const {
         if (!st_) return;
@@ -2997,6 +3000,9 @@ struct Window::PromptGemm {
 };
 
 int Window::prompt_chunk_rows() const { return pg_ ? pg_->MT : 0; }
+// The chunk's residual rows, one row per token in the chunk - what a split stage sends onward. Device pointer, the
+// same thing the CUDA path hands a prompt chunk's consumer; valid until the next chunk starts.
+float* Window::prompt_rows_ptr() { return pg_ ? pg_->R.as<float>() : nullptr; }
 
 bool Window::prompt_gemm_on(int64_t n) const {
     static const bool on = [] {
@@ -3730,7 +3736,10 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
             for (int64_t c = 0; c < n && ok; c += C) {
                 const int k = (int) std::min<int64_t>(C, n - c);
                 for (int i = 0; i < k; ++i) tk32[(size_t) i] = (int32_t) tokens[c + i];
-                ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err) && (!on_chunk || on_chunk(nullptr, k, pos0 + c, err));
+                ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err);
+                // Same hand-off as prompt() above: the streaming path's chunk residuals live in `pg_->R`, and a
+                // split stage needs them. Null here was the other half of the same defect.
+                if (ok && on_chunk) ok = on_chunk(g_window->prompt_rows_ptr(), k, pos0 + c, err);
             }
             g_window->prompt_region(false);
             return ok;
@@ -3742,7 +3751,7 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
         for (int i = 0; i < k; ++i) tk[i] = (int32_t) tokens[c + i];
         if (!g_window->run(k, tk, pos0 + c, false, out, err) || !g_window->commit(k, err)) return false;
         if (!g_window->tap_deliver_dec(k, pos0 + c, err)) return false;   // DFlash2
-        if (on_chunk && !on_chunk(nullptr, k, pos0 + c, err)) return false;
+        if (on_chunk && !on_chunk(g_window->window_rows_ptr(), k, pos0 + c, err)) return false;
     }
     return true;
 }
