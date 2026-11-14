@@ -103,7 +103,11 @@ void q2_rows_any_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const A
 const ExpertLayout& expert_layout();
 /// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
 /// Versions up to kExpertLayoutVersion are read; a newer one is refused (a newer packer wrote it).
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+/// Loads a pack's expert index. `layer_begin`/`layer_end` select the layers this process owns: a stage pack stores
+/// only those layers' blobs, so the contiguity check and `total` cover that range alone, and layers outside it are
+/// left empty. The defaults describe a whole-model pack.
+bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err,
+                        int64_t layer_begin = 0, int64_t layer_end = -1);
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 /// v5 = v4 plus `hadamard.txt` beside it: Hadamard-folded experts (hadamard.hpp), written only for such models,

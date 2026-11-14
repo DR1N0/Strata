@@ -1454,9 +1454,16 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
             err = "FileExpertSource: the native expert layout is incomplete";
             return false;
         }
+        // A stage pack has no entries for the layers it does not own; those read as zero and are skipped rather than
+        // rejected, because the whole point of the pack is that their blobs are not in the file at all.
         uint64_t at = 0;
         for (int64_t layer = 0; layer < n_layers; ++layer) {
             const size_t i = (size_t) layer;
+            if (layout.bytes[i] == 0 && layout.offset[i] == 0) {
+                layer_offsets[i] = 0;
+                layer_blob_bytes[i] = 0;
+                continue;
+            }
             const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
             if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
                 bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {

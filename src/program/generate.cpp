@@ -4664,7 +4664,11 @@ int main(int argc, char** argv) {
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
         const strata::core::ModelGeometry& g0 = strata::core::kCompiledGeometry;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        // A stage pack holds only the layers this process computes, so the index is loaded for that range and the
+        // blob offsets inside it start at zero again.
+        const int64_t el_begin = o.stage_end >= 0 ? o.stage_begin : 0;
+        const int64_t el_end = o.stage_end >= 0 ? o.stage_end : -1;
+        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err, el_begin, el_end)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
