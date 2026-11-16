@@ -56,7 +56,6 @@
 #include "strata/core/session.hpp"
 #include "strata/core/boundary_wire.hpp"
 #include "strata/core/boundary_socket.hpp"
-#include "stage_ring.hpp"
 #include "stage_worker.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -622,9 +621,6 @@ struct Options {
     /// head: the sampled tokens, for whatever drove the request).  The senders do not bind a port - TCP picks
     /// an ephemeral one - so nothing but the listen port can collide, which matters while both stages run on
     /// one machine.  A ring, not a pipeline: a tail stage's downstream is the head's ingress.
-    std::string stage_listen;    ///< --listen PORT: this stage's ingress (bind + accept)
-    std::string stage_downstream;///< --downstream HOST:PORT: where this stage sends its rows (or its token)
-    std::string stage_orch;      ///< --orch HOST:PORT: the head's tokens for the request's driver
     std::string stage_agent;     ///< --agent HOST:PORT: the local agent; the engine then listens on nothing and
                                  ///< knows no topology - the agent owns routing
     int64_t stage_requests = 1;  ///< --max-requests N: serve N requests before exiting (1 = the single-shot run)
@@ -3448,9 +3444,6 @@ int main(int argc, char** argv) {
         else if (a == "--stage-begin") o.stage_begin = std::atoll(next("--stage-begin"));
         else if (a == "--stage-end") o.stage_end = std::atoll(next("--stage-end"));
         else if (a == "--stage-input") o.stage_input = next("--stage-input");
-        else if (a == "--listen") o.stage_listen = next("--listen");
-        else if (a == "--downstream") o.stage_downstream = next("--downstream");
-        else if (a == "--orch") o.stage_orch = next("--orch");
         else if (a == "--agent") o.stage_agent = next("--agent");
         else if (a == "--max-requests") o.stage_requests = std::atoll(next("--max-requests"));
         else if (a == "--stage-output") o.stage_output = next("--stage-output");
@@ -9329,9 +9322,6 @@ int main(int argc, char** argv) {
     std::vector<float> stage_rows_all;
     strata::core::BoundaryFrame stage_frame;   // the --stage-input frame: its R feeds the prompt path
     std::vector<strata::core::BoundaryFrame> stage_decode_frames;   // the producer's decode windows, by position
-    strata::core::BoundarySocket stage_link;   // this stage's ingress: what its upstream sends
-    strata::core::BoundarySocket stage_out;    // --downstream: rows onward (or the token, from a tail stage)
-    strata::core::BoundarySocket orch_link;    // --orch (head only): the sampled tokens, for the driver
     auto put_input = [&](int64_t tok, int64_t pos) -> bool {
         if (stage_in != nullptr) {
             int64_t posrec[2] = {0, 0};
@@ -20108,7 +20098,7 @@ int main(int argc, char** argv) {
 
     // Network workers use one explicit ring state machine, not two autonomous speculative loops.
     // T=1 includes prompt positions: a correctness baseline; batched prefill is a later optimization.
-    if (!o.stage_agent.empty() || !o.stage_listen.empty()) {
+    if (!o.stage_agent.empty()) {
         if (multi_gpu || o.stage_end < 0 || !o.stage_input.empty()) {
             std::fprintf(stderr, "stage: explicit stage range required; local multi-GPU/file input not supported\n");
             return 2;
@@ -20137,10 +20127,9 @@ int main(int argc, char** argv) {
         // is the engine's chunked reader: given the whole prompt it walks it in chunks and hands each chunk's rows
         // over, which is the only shape whose cost tracks chunks instead of tokens.
         strata::program::StageWorkerStats worker_stats;
-        strata::program::StageRingStats stage_stats;
         // The engine's own counters go wherever the active path keeps them; the compute callback cannot know which.
-        int64_t* experts_out = &stage_stats.experts_streamed;
-        int64_t* filebytes_out = &stage_stats.file_read_bytes;
+        int64_t* experts_out = &worker_stats.experts_streamed;
+        int64_t* filebytes_out = &worker_stats.file_read_bytes;
         strata::prefill::Prefill stage_prefill;
         stage_prefill.set_cpu_pool(&pool);
         stage_prefill.set_stage(o.stage_begin, o.stage_end >= g.n_layers ? -1 : o.stage_end, nullptr);
@@ -20209,13 +20198,6 @@ int main(int argc, char** argv) {
         std::string stage_identity;
         for (const auto& shard : o.native_shards)
             stage_identity += std::filesystem::path(shard).filename().string() + ";";
-        strata::program::StageRingConfig rc;
-        rc.listen = o.stage_listen; rc.downstream = o.stage_downstream; rc.orch = o.stage_orch;
-        rc.lo = o.stage_begin; rc.hi = o.stage_end; rc.layers = g.n_layers; rc.max_context = o.max_context;
-        rc.fingerprint = strata::core::boundary_model_fingerprint(
-            g.n_layers, g.n_embd, g.hc, g.n_expert, g.n_expert_used, stage_identity.c_str());
-        rc.eos_ids = o.eos_ids; rc.stop_eos = o.stop_eos;
-        rc.max_requests = o.stage_requests > 0 ? o.stage_requests : 1;
         kvg_start(xcache.slots());
         // Filled by both sides of the callback: the transport times and bytes are the ring's, the expert and file
         // counters belong to this stage's engine, which knows its own residency answer.
@@ -20267,17 +20249,15 @@ int main(int argc, char** argv) {
             return stage_ver.commit(1, re);
         };
         bool ok = false;
-        if (!o.stage_agent.empty()) {
-            // The mesh form: this engine links to its local agent, listens on nothing, and knows no topology.
-            experts_out = &worker_stats.experts_streamed;
-            filebytes_out = &worker_stats.file_read_bytes;
-            strata::program::StageWorkerConfig wc;
-            wc.agent = o.stage_agent; wc.lo = o.stage_begin; wc.hi = o.stage_end;
-            ok = strata::program::stage_worker_run(wc, compute_stage, reset_stage, prefill_stage,
-                                                   &worker_stats, err);
-        } else {
-            ok = strata::program::stage_ring_run(rc, compute_stage, reset_stage, &stage_stats, err);
-        }
+        // The mesh form: this engine links to its local agent, listens on nothing, and knows no
+        // topology.  It is the only stage form left: the ring's --listen/--downstream/--orch
+        // path was removed when --agent replaced it.
+        experts_out = &worker_stats.experts_streamed;
+        filebytes_out = &worker_stats.file_read_bytes;
+        strata::program::StageWorkerConfig wc;
+        wc.agent = o.stage_agent; wc.lo = o.stage_begin; wc.hi = o.stage_end;
+        ok = strata::program::stage_worker_run(wc, compute_stage, reset_stage, prefill_stage,
+                                               &worker_stats, err);
         if (!ok) std::fprintf(stderr, "stage: %s\n", err.c_str());
         return ok ? 0 : 1;
     }
@@ -20390,76 +20370,13 @@ int main(int argc, char** argv) {
         // read uninitialized ones and the batch indexer threw).  `-1` for the end = "to the last layer".
         if (!multi_gpu && o.stage_end >= 0)
             prefill.set_stage(o.stage_begin, o.stage_end >= g.n_layers ? -1 : o.stage_end, nullptr);
-        // ---- THE WIRING --------------------------------------------------------------------------------
-        // One listening port (this stage's ingress: what its upstream sends) and two destinations that do not
-        // bind a port at all - `--downstream` (rows onward, or the token for a tail stage) and `--orch` (the
-        // head's tokens for the request's driver).  Nothing but the listen port can collide when two stages
-        // share a machine.
-        // CONNECT FIRST, ACCEPT LAST.  Two stages on one machine each wait for their upstream, so accepting
-        // before connecting deadlocks: both block in `accept` and neither ever makes its downstream call.  The
-        // outgoing halves are initiated first (they retry until the peer listens), and the ingress accepts
-        // once every destination is up.
-        strata::core::BoundarySocket server;   // this stage's ingress, accepting after the outgoing links
-        if (!o.stage_listen.empty()) {
-            int bound = 0;
-            std::string lerr;
-            if (!strata::core::boundary_parse_address(":" + o.stage_listen, lerr, bound, lerr) &&
-                !strata::core::boundary_parse_address("*:" + o.stage_listen, lerr, bound, lerr)) {
-                std::fprintf(stderr, "strata generate: %s\n", lerr.c_str());
-                return 1;
-            }
-            if (!server.listen_on(bound, bound, lerr)) {
-                std::fprintf(stderr, "strata generate: %s\n", lerr.c_str());
-                return 1;
-            }
-            std::fprintf(stderr, "strata generate: ingress bound on port %d\n", bound);
-        }
-        if (!o.stage_downstream.empty()) {
-            std::string host;
-            int port = 0;
-            std::string lerr;
-            if (!strata::core::boundary_parse_address(o.stage_downstream, host, port, lerr) ||
-                !stage_out.connect_to(host, port, 180000, lerr)) {
-                std::fprintf(stderr, "strata generate: --downstream: %s\n", lerr.c_str());
-                return 1;
-            }
-            std::fprintf(stderr, "strata generate: downstream connected to %s\n", stage_out.peer().c_str());
-        }
-        if (!o.stage_orch.empty()) {
-            std::string host;
-            int port = 0;
-            std::string lerr;
-            if (!strata::core::boundary_parse_address(o.stage_orch, host, port, lerr) ||
-                !orch_link.connect_to(host, port, 180000, lerr)) {
-                std::fprintf(stderr, "strata generate: --orch: %s\n", lerr.c_str());
-                return 1;
-            }
-            std::fprintf(stderr, "strata generate: orchestrator connected at %s\n", orch_link.peer().c_str());
-        }
-        if (server.valid()) {
-            std::string lerr;
-            if (!server.accept_one(stage_link, lerr)) {
-                std::fprintf(stderr, "strata generate: ingress: %s\n", lerr.c_str());
-                return 1;
-            }
-            std::fprintf(stderr, "strata generate: ingress accepted from %s\n", stage_link.peer().c_str());
-        }
         // A STAGE THAT DOES NOT OWN LAYER 0 reads its prompt rows from --stage-input instead of embedding tokens.
         if (o.stage_end >= 0)
             std::fprintf(stderr, "strata generate: prompt stage range [%lld, %lld)\n", (long long) o.stage_begin,
                          (long long) o.stage_end);
         // A NON-HEAD STAGE READS ROWS FROM ITS INGRESS: its upstream sent them before this stage started
         // computing anything, so they are already queued on the socket.  The head has no upstream rows.
-        if (!o.stage_input.empty() || (!o.stage_listen.empty() && o.stage_orch.empty() && stage_link.valid())) {
-            std::vector<uint8_t> in_bytes;
-            if (stage_link.valid()) {   // the predecessor hands its prompt frame over the link
-                std::string lerr;
-                if (!stage_link.recv_frame(in_bytes, lerr, (size_t) 64 << 20)) {
-                    std::fprintf(stderr, "strata generate: %s\n", lerr.c_str());
-                    return 1;
-                }
-                std::fprintf(stderr, "strata generate: prompt frame received (%zu bytes)\n", in_bytes.size());
-            } else {
+        if (!o.stage_input.empty()) {
             std::FILE* in = std::fopen(o.stage_input.c_str(), "rb");
             if (in == nullptr) {
                 std::fprintf(stderr, "strata generate: cannot read --stage-input %s\n", o.stage_input.c_str());
@@ -20483,7 +20400,6 @@ int main(int argc, char** argv) {
                 }
             }
             std::fclose(in);
-            }
             std::string berr;
             size_t consumed = 0;
             if (!strata::core::boundary_deserialize(in_bytes.data(), in_bytes.size(), stage_frame, berr, &consumed)) {
@@ -20581,7 +20497,7 @@ int main(int argc, char** argv) {
         }
         // A SPLIT STAGE EXPORTS ITS PROMPT ROWS: the drafter's callback above is only installed with --mtp, so
         // without it nothing wrote the chunk rows and a later stage had no position 0 to start from.
-        if ((final_r != nullptr || stage_link.valid()) && o.stage_end >= 0 && o.stage_end < g.n_layers) {
+        if (final_r != nullptr && o.stage_end >= 0 && o.stage_end < g.n_layers) {
             prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
                 // ONE FRAME PER CHUNK, the same object the decode path writes: `R` from this chunk, and `bo`/`inj`
                 // zeroed (they are a verify-window quantity; a later stage's prompt path reads only `R`).
@@ -20608,7 +20524,6 @@ int main(int argc, char** argv) {
                     std::fwrite(bytes.data(), 1, bytes.size(), final_r);
                     std::fflush(final_r);
                 }
-                if (stage_out.valid() && !stage_out.send_frame(bytes, e)) return false;
                 return true;
             };
         }
@@ -21611,41 +21526,6 @@ int main(int argc, char** argv) {
             else if (strata::spec::mtp_q_applies(use_mtp, spec_uses_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp) && o.spec_corrupt <= 0)
                 ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
             const auto decode_pool_fn = use_mtp && mtp.prob() ? &drive_pool_multi_invariant : &drive_pool_multi;
-            // THE PREVIOUS STAGE'S ROWS FOR THIS WINDOW: one frame per window, in the order the producer sent
-            // them.  The verifier then runs its layers on the very rows the producer computed, which is the whole
-            // point of the split - without this it would re-embed a token it never saw.
-            if (stage_link.valid() && o.stage_orch.empty()) {
-                std::vector<uint8_t> in_frame;
-                std::string ferr;
-                if (!stage_link.recv_frame(in_frame, ferr, (size_t) 64 << 20)) {
-                    std::fprintf(stderr, "strata generate: %s\n", ferr.c_str());
-                    return 1;
-                }
-                size_t used_b = 0;
-                strata::core::BoundaryFrame wf;
-                if (!strata::core::boundary_deserialize(in_frame.data(), in_frame.size(), wf, ferr, &used_b)) {
-                    std::fprintf(stderr, "strata generate: boundary: %s\n", ferr.c_str());
-                    return 1;
-                }
-                const strata::core::BoundaryTensor* wr = wf.find("R");
-                const strata::core::BoundaryTensor* wb = wf.find("bo");
-                const strata::core::BoundaryTensor* wi = wf.find("inj");
-                if (wr == nullptr || wb == nullptr || wi == nullptr || wr->rows != T) {
-                    std::fprintf(stderr, "strata generate: boundary: the window frame is %lld rows, this window is %d\n",
-                                 wr == nullptr ? (long long) -1 : (long long) wr->rows, T);
-                    return 1;
-                }
-                for (int64_t r = 0; r < T; ++r) {
-                    std::memcpy(hand_host + (size_t) r * (size_t) HB, wr->host + (size_t) r * (size_t) wr->elems_per_row,
-                                (size_t) wr->elems_per_row * sizeof(float));
-                    std::memcpy(hand_host + (size_t) r * (size_t) HB + (size_t) (g.hc * g.n_embd),
-                                wb->host + (size_t) r * (size_t) wb->elems_per_row,
-                                (size_t) wb->elems_per_row * sizeof(float));
-                    std::memcpy(hand_host + (size_t) r * (size_t) HB + (size_t) ((g.hc + 1) * g.n_embd),
-                                wi->host + (size_t) r * (size_t) wi->elems_per_row,
-                                (size_t) wi->elems_per_row * sizeof(float));
-                }
-            }
             if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err)) {
                 // The graph of a window size is captured the first time it is used, and the draft source took VRAM: when the capture runs
                 // out of memory the window gets one row narrower (the widths below it are already captured) instead of the run failing.
@@ -21658,53 +21538,6 @@ int main(int argc, char** argv) {
                 }
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
-            }
-            // ---- THE RING'S EXCHANGE, ONE WINDOW AT A TIME -------------------------------------------------
-            // Head: hand this window's rows to the tail and take back the tokens it sampled (this stage has no
-            // head layer, so `outv` is unset here).  Tail: it already sampled into `outv`; send those tokens back
-            // to the head, which forwards them to the user side and decides whether generation goes on.
-            if (stage_link.valid()) {
-                if (o.stage_begin == 0) {
-                    strata::core::BoundaryFrame out_f;
-                    std::string rerr;
-                    if (!ver.boundary_capture(out_f, T, p, main_cs, rerr)) {
-                        std::fprintf(stderr, "strata generate: %s\n", rerr.c_str());
-                        return 1;
-                    }
-                    out_f.kind = strata::core::kBoundaryRows;
-                    out_f.model_fingerprint = boundary_fp;
-                    std::vector<uint8_t> ob;
-                    if (!strata::core::boundary_serialize(out_f, ob, rerr) ||
-                        !stage_out.send_frame(ob, rerr)) {
-                        std::fprintf(stderr, "strata generate: %s\n", rerr.c_str());
-                        return 1;
-                    }
-                    std::vector<uint8_t> ib;
-                    strata::core::BoundaryFrame in_f;
-                    size_t used_i = 0;
-                    if (!stage_link.recv_frame(ib, rerr, (size_t) 64 << 20) ||
-                        !strata::core::boundary_deserialize(ib.data(), ib.size(), in_f, rerr, &used_i)) {
-                        std::fprintf(stderr, "strata generate: %s\n", rerr.c_str());
-                        return 1;
-                    }
-                    for (int64_t r2 = 0; r2 < T && r2 < in_f.rows; ++r2) outv[(size_t) r2] = in_f.next_token[r2];
-                } else {
-                    strata::core::BoundaryFrame tok_f;
-                    std::string rerr;
-                    tok_f.kind = strata::core::kBoundaryToken;
-                    tok_f.model_fingerprint = boundary_fp;
-                    tok_f.pos0 = p;
-                    tok_f.rows = T;
-                    tok_f.stage_begin = o.stage_begin;
-                    tok_f.stage_end = o.stage_end;
-                    for (int64_t r2 = 0; r2 < T; ++r2) tok_f.next_token[r2] = outv[(size_t) r2];
-                    std::vector<uint8_t> ob;
-                    if (!strata::core::boundary_serialize(tok_f, ob, rerr) ||
-                        !stage_out.send_frame(ob, rerr)) {
-                        std::fprintf(stderr, "strata generate: %s\n", rerr.c_str());
-                        return 1;
-                    }
-                }
             }
             // --dump-final-r ON THE SPECULATIVE PATH: the token loop breaks out at the last prompt position
             // (`if (o.spec > 0 && pos >= n_prompt - 1) ... break`), so decode never reaches that write site.  A
@@ -21730,12 +21563,6 @@ int main(int argc, char** argv) {
                 if (final_r != nullptr) {
                     std::fwrite(bytes.data(), 1, bytes.size(), final_r);
                     std::fflush(final_r);
-                }
-                // THE NEXT STAGE'S DECODE INPUT: one frame per window, so its verifier runs this stage's layers
-                // on the same rows this stage just computed instead of re-embedding a token it never saw.
-                if (stage_out.valid() && !stage_out.send_frame(bytes, berr)) {
-                    std::fprintf(stderr, "strata generate: %s\n", berr.c_str());
-                    return 1;
                 }
             } else if (final_r != nullptr) {
                 const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
