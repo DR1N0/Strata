@@ -623,7 +623,6 @@ struct Options {
     /// one machine.  A ring, not a pipeline: a tail stage's downstream is the head's ingress.
     std::string stage_agent;     ///< --agent HOST:PORT: the local agent; the engine then listens on nothing and
                                  ///< knows no topology - the agent owns routing
-    int64_t stage_requests = 1;  ///< --max-requests N: serve N requests before exiting (1 = the single-shot run)
     std::string stage_output;   ///< where this stage writes its output residual
     bool greedy = true;
     uint64_t seed = 0;
@@ -3445,7 +3444,6 @@ int main(int argc, char** argv) {
         else if (a == "--stage-end") o.stage_end = std::atoll(next("--stage-end"));
         else if (a == "--stage-input") o.stage_input = next("--stage-input");
         else if (a == "--agent") o.stage_agent = next("--agent");
-        else if (a == "--max-requests") o.stage_requests = std::atoll(next("--max-requests"));
         else if (a == "--stage-output") o.stage_output = next("--stage-output");
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));

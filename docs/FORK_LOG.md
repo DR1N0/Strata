@@ -4,90 +4,150 @@
 
 ## 分叉概况
 
-数据取自 2026-11-13，基准 `504b1433`（分叉起点）：
+基准 `504b1433`（分叉起点），数据取自 2026-11-16：
 
 | 项目 | 数值 |
 |---|---|
-| 我们的提交 | 6 |
-| 我们的改动 | 22 文件，+2775 / −37 |
-| 上游同期改动 | 310 文件，+12403 / −825（159 提交） |
-| 双方都改过的文件 | **3 个** |
+| 我们的提交 | 25 |
+| 我们的改动 | 26 文件，+2971 / −64 |
+| 上游同期改动 | 159 提交 |
+| 双方都改过的文件 | **4 个** |
 
-重叠的 3 个文件是未来冲突的唯一来源，改它们时要格外小心：
+### 上游从来没有任何分段能力
 
-| 文件 | 我们的改动 | 性质 |
+这一条决定了整个分叉的性质，值得单独记：
+
+```sh
+git show 504b1433:src/program/generate.cpp | grep -c 'stage_agent\|stage_listen\|stage_begin'   # 0
+git show origin/main:src/program/generate.cpp | grep -c 'stage_agent\|stage_listen\|stage_begin' # 0
+```
+
+上游只有完整模型的单机执行、`--serve`（单机服务，含 batch/cancel/会话 park）和 `--multi-gpu`（单机多卡）。**层切分、边界帧、`--agent`、stage worker 全部是新增**，不是对上游代码的修改。所以"我们的能力"和"上游的能力"在形态上是正交的，不存在"上游某天也做了切分、于是我们得改"的风险。
+
+### 冲突面：文件级重叠 4 个，块级重叠 0 个
+
+重叠的文件是未来冲突的唯一来源：
+
+| 文件 | 我们的改动 | 上游是否碰 |
 |---|---|---|
-| `src/program/generate.cpp` | +540 | 最大单点，ring 入口与 CLI |
-| `src/prefill/prefill.cpp` | 6 行 | 放宽中段必须有进程内后继的断言 |
-| `cmake/strata_gpu_engine.cmake` | 2 行 | 链接 ring 传输源文件 |
+| `src/program/generate.cpp` | +493 | 是（20 个改动块） |
+| `src/core/verify.cpp` | +118 | **否** |
+| `src/prefill/prefill.cpp` | +12 | 是 |
+| `src/core/expert_source.cpp` | +7 | 是 |
+| `cmake/strata_gpu_engine.cmake` | +2 | 是 |
 
-`src/core/verify.cpp` 我们改了 118 行，但**上游同期没碰这个文件**，冲突风险低。
+但"重叠文件"不等于"重叠行"。按改动块的行号对照：
+
+```
+我们的块: 54 607 3441 4657 5286 5878 6800 7342 9234 9301 11314 | 20096 20365 20461 20495 20540 20575 20686 20869 21539
+上游的块: 33 127 1715 1872 1904 3775 3789 7798 10518 ... 19308 19861
+```
+
+我们改动量的主体（`20096`–`21539`，14 个块）**和上游零重叠**——那是 `generate.cpp` 末尾的 stage 实现，上游的改动止于 `19861`。前部那些交错的 11 个块都是 1–39 行的粘合点（最常见的是插入一行 `sp.set_stage(...)`），冲突时容易解。
+
+**结论：不需要把 stage 实现抽成独立头文件来降冲突。** 那样做只改善可读性，因为那 174 行本来就不会撞上游。真正需要留神的是前部粘合点，而它们量小。
+
+## 已删除：ring
+
+`8bbe74a7` 删除了 `src/program/stage_ring.hpp`（218 行）+ 两个测试（163 行）+ `generate.cpp` 里 201 行，净 −568/+14。
+
+**为什么**：ring 是第一个 mesh 实现，每个 stage 知道自己的 ingress / downstream / orchestrator，尾段的 token 环回头部，靠"最后一个 stage 的下游是 head"闭合成环。它只能承受固定流水线，一旦 mesh 可路由（A→C 变成 A→D 而引擎不重启）就失效。`--agent` 取代了它：引擎不监听、不知道拓扑，路由归本地上层 agent。
+
+两者并存期间，它们**共用同一组 compute 回调**，于是每次改切分的计算签名都要改两遍、测两遍，而 ring 那条路没人走。这不是历史记录，是活跃的死代码——删除是净收益。
+
+同一次清理删掉了 `--max-requests`：它只被 `StageRingConfig` 读取，ring 一删就成了只写不读的参数——存在但无效果，比不存在更糟。`--agent` 模式本来就是无限循环收帧直到连接关闭。
+
+顺带修掉一个隐患：`--stage-input` 原本在 ring 与文件两条分支之间选择，而文件分支在 `else` 里重新声明了 `in_bytes`，遮蔽了外层同名变量。它之所以能工作，只因为两条分支互斥。ring 删掉后只剩一条路径、一个声明。
 
 ## 逐提交记录
 
-### `d1b71162` feat(dsv41): add opt-in cut20 Metal boundary replay
+按功能分组，不按时间顺序。标"可上游"的判断供将来评估 PR 时参考。
 
-- **改动**：`src/dsv41/ds4_model.cu`（+59）、`ds4_model.hpp`（+6）等 3 文件 +154/−2，加入可选的 cut20 边界回放能力。
+### 组 A：layer-range 执行（区间与全局依赖）
+
+| 提交 | 内容 | 可上游 |
+|---|---|---|
+| `a85fbcc0` | `--stage-begin/--stage-end/--stage-input`：单进程只算一段 | 可能可以，纯加法 |
+| `677157af` | `session_loop` 按会话的层范围推进 | 可能可以，与上一条同组 |
+| `ff277821` | Metal 的 T=1 layer-range | 可能可以 |
+| `953aee10` | pack 只装一个 stage 的层 | 否，绑定我们的打包器 |
+
+**为什么**：没有它，任何 stage 都会试图算完整模型。这是切分的最低前提。
+
+**注意**：`src/core/verify.cpp` 的新增 118 行**全部位于 `#if defined(STRATA_GPU_METAL)` 内**，HIP/CPU 构建的预处理结果不变——这是刻意的隔离，改这个文件时不要破坏它。
+
+### 组 B：边界帧与传输
+
+| 提交 | 内容 | 可上游 |
+|---|---|---|
+| `9eeeb837` | 边界帧 wire v3（`boundary_wire.*`）+ socket（`boundary_socket.*`）+ 状态机 | 部分可以，但价值存疑 |
+| `5f03dd41` | 修注释：布局注释写 v4，常量是 3 | 是（上游若在意注释） |
+
+**为什么**：跨机只传边界张量，不传整个模型状态。帧自描述（按名寻址、带 `model_fingerprint`），所以两个跑着不同 checkpoint 或不同量化几何的 stage 会拒绝彼此的字节，而不是在其上继续计算。
+
+两个踩过的坑值得记住：
+
+1. **帧必须按名寻址。** 早期按偏移量传递，`rebind()` 用全零缓存偏移覆盖了张量指针，`bo`/`inj` 都指向了 `R`，而旧测试只比对存储区字节因而漏检。
+2. **控制帧不能借用数据帧的形状。** 一次 `rows=0` 的控制帧被 wire 的形状校验拒绝，而拒绝直接杀死了接收它的引擎。现在的做法是控制帧带一个占位 token；根因（END 同时承担数据与控制）记在待办里。
+
+### 组 C：stage worker 与 agent（当前产品路径）
+
+| 提交 | 内容 | 可上游 |
+|---|---|---|
+| `820ed5a7` | **`--agent`**：引擎不监听、不管拓扑，路由归本地 agent | 否，这是产品形态 |
+| `12b15aa9` | prompt/decode 的 kind 随帧下行 | 可能可以 |
+| `15830b46` | 非 entry stage 必须先收齐所有 chunk 行才能跑 prompt 路径 | 可能可以 |
+| `cfb7ed05` | prompt 走 Prefill 而不是每位置一帧 | 可能可以 |
+| `d065d8fd` | 上报 prompt 路径的磁盘读取与设备流量 | 是（可观测性） |
+| `89321c75` | mesh stage 的变量不再自称 ring | 是（纯重命名） |
+| `d354419b` | 空闲 stage 等 10 分钟，不是 120 秒 | 是 |
+
+**`--agent` 是这套分叉的核心**：引擎连本地 agent，agent 拥有路由。这样一条 mesh 链路可以在不重启任何引擎的情况下改道。
+
+`15830b46` 和 `cfb7ed05` 是同一件事的两半：一个 stage 的 prompt 路径需要**全部** chunk 行才能跑（那些行在 token 顺序上是一个张量），所以上游先发一整帧 prompt 头、再发 chunk 帧；entry stage 相反，边算 chunk 边发。
+
+### 组 D：Metal 的 prompt chunk 路径
+
+| 提交 | 内容 |
+|---|---|
+| `a757657d` | 把 chunk 的残差行交给 `on_chunk`，而不是 null |
+| `129873c8` | chunk 走本 stage 的层，并从上游的行开始 |
+| `84a2a41f` | chunk 从 stage 取 handoff 行，而不是 decode 缓冲 |
+| `98eae923` | 用 setter 发布 handoff 指针，而不是 friendship |
+| `0764297f` | 读 chunk 自己的那一段 handoff 行，不是每次都读基址 |
+
+五个提交修的是同一个缺陷族：Metal 侧的 chunk 路径把"这一块的行"和"整个 decode 缓冲"混在一起。`0764297f` 是最后一块拼图（每 chunk 读自己的偏移）。
+
+### 组 E：ring 的可观测性与多请求（已被删除的路径）
+
+`d2d74a8b`（每个 stage 的 position/compute/transport 记账）、`1c2e560b`（`--max-requests`：一个进程串行服务 N 个请求）、`04c577f6`（一个请求一个 RDONE，不是一个进程一个）——这三个随 ring 一起失去作用。
+
+**但 `--max-requests` 的生命周期问题在这里暴露了**：它只被 ring 的 `StageRingConfig` 读取，`StageWorkerConfig` 没有这个字段。所以 `--agent` 模式是**无限循环收帧、严格串行**，直到连接关闭。这个不对称在 R4 加并发时必须先解决。
+
+### 组 F：DSV41 实验（一次性）
+
+`d1b71162` feat(dsv41): cut20 Metal boundary replay。
+
 - **为什么**：DeepSeek-V4.1 阶段的早期可行性实验，验证 Metal 侧切点边界能否复现。
-- **可上游**：否。这是 DSV41 专用的一次性实验代码，对通用引擎无价值。
-- **状态**：保留在分支内，不推动上游。若清理 DSV41 支持，此项可一并删除。
-- **注**：DSV41 已不在当前阶段适配范围（单机 2 tok/s 的瓶颈是驻留专家太少与权重过大，双机翻倍后仍不达使用标准），但模型本身仍在路线图内。
+- **可上游**：否。DSV41 专用的一次性代码，对通用引擎无价值。
+- **状态**：保留但不在当前适配范围。DSV41 单机 2 tok/s 的瓶颈是驻留专家太少与权重过大，双机翻倍后仍不达使用标准。
 
-### `4f25ec2a` fix(metal): report batch dispatch evidence and completion progress
+### 组 G：文档与测试
 
-- **改动**：`src/core/verify.cpp`（+5）、`tests/core/test_metal_batch_progress.py`（+126）等 3 文件 +173/−1。让 Metal 侧上报 batch dispatch 证据与完成进度。
-- **为什么**：Metal 的批量调度此前无法从外部确认是否真的发生了，导致"看起来在跑"却无法验证的观测盲区。
-- **可上游**：**可能可以**。这是通用的可观测性改进，与切分无关。若上游有兴趣，是一个干净的 PR 候选。
-- **状态**：暂留本地，等 M0 指标接口稳定后再评估是否提 PR。
-
-### `677157af` feat(core): session_loop walks the session's layer range
-
-- **改动**：`src/core/session.cpp` 15 行。让 `session_loop` 按会话的层范围推进，而不是永远走全部层。
-- **为什么**：区间执行的必要前提。没有它，任何 stage 都会试图算完整模型。
-- **可上游**：**可能可以**。这是一个通用能力（"只跑一部分层"），实现是加法且小。上游若有分阶段加载或流水线需求会需要它。
-- **状态**：与 `a85fbcc0` 绑定，作为一组提 PR 更合理。
-
-### `a85fbcc0` feat(generate): --stage-begin/--stage-end/--stage-input
-
-- **改动**：`src/program/generate.cpp` +46/−3。新增三个 CLI：层区间起止与外部边界输入。
-- **为什么**：让**单个进程只计算模型的一段**，并且能从上一次的边界继续。这是切分的入口，也是最容易理解的一块。
-- **可上游**：**可能可以**。参数是纯加法，无行为变更（默认 `0..n_layers`）。
-- **状态**：与 `677157af` 一组。
-
-### `9eeeb837` Implement typed multi-stage ring and orchestrator-ready execution
-
-- **改动**：14 文件 +2123/−14。核心提交，包含：
-  - `include/strata/core/boundary_wire.hpp` + `src/core/boundary_wire.cpp`（新）：边界帧序列化，wire v3，50 字节头 `<IHHHQqqqq`，多张量按名寻址，预留 `next_token` 槽。
-  - `include/strata/core/boundary_socket.hpp` + `src/core/boundary_socket.cpp`（新）：TCP 收发，Windows `SO_EXCLUSIVEADDRUSE`，超时与优雅关闭。
-  - `src/program/stage_ring.hpp`（新）：单一显式状态机——READY 绕环、REQUEST 走 head、TOKEN 回 orch。
-  - `src/core/verify.cpp`：`boundary_capture` / `boundary_apply`，携带 pending `R/bo/inj`。
-  - `src/prefill/prefill.cpp`：放宽中段断言。
-  - `tools/test_boundary_wire.cpp`（353 行）、`tools/test_stage_ring.cpp`（62 行）：187 项检查。
-- **为什么**：这是整个分布式执行的地基。三个关键设计：
-  1. **边界是三张量而非一张**。Verifier 用融合跨层计算，pending FFN 的 `bo` 与 `inj` 必须随 `R` 一起移交；只传 `R` 会算错且不易察觉。
-  2. **帧按名寻址**。早期实现按偏移量传递，`rebind()` 用全零缓存偏移覆盖了张量指针，导致 `bo`/`inj` 都指向 `R`，而旧测试只比对存储区字节因而漏检。现在按名 + 精确偏移测试。
-  3. **显式状态机而非散落的阻塞调用**。多节点最怕死锁，状态机让每个阶段的阻塞点唯一可读。
-- **可上游**：**部分可以，但价值存疑**。协议、socket、状态机都是通用的，上游若无多机需求不会接受这么大一块。建议**不主动提**，作为分叉的核心资产维护。
-- **状态**：长期保留。
-
-### `ff277821` feat(metal): support T=1 layer-range ring stages
-
-- **改动**：`metal/CMakeLists.txt`、`metal/src/engine/stage.h`（新 44 行）、`metal/src/engine/window.cpp`（+102/−14）、`src/core/verify.cpp`（+32）、`tests/core/test_metal_stage.py`（新 100 行）。
-- **为什么**：Mac 端要能作为 ring 的一环。把 stage 归属传入 Metal window，保留 pending 移交，把专家流式裁剪映射到全局层号；默认仍是全模型，并显式拒绝不支持的 staged batching 与 MTP。
-- **可上游**：**可能可以**，与 `677157af`/`a85fbcc0` 同属"只跑一部分层"的能力。
-- **状态**：保留。注意 `src/core/verify.cpp` 的新增 32 行**全部位于 `#if defined(STRATA_GPU_METAL)` 内**，HIP/CPU 构建的预处理结果不变——这是刻意的隔离，改这个文件时不要破坏它。
+`e1e19ee3`（本文件）、`4f25ec2a`（Metal batch 派发证据，**可上游**，是干净的可观测性改进）、`tools/test_boundary_wire.cpp`（353 行，187 项检查）。
 
 ## 维护规则
 
-1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。这条纪律让分叉保持在 22 个文件。哪怕代码要贴着引擎写，宁可多一层接口。
-2. **保持加法为主。** 目前 +2775/−37，删除极少。一旦开始大段重写上游代码，合并成本会失控。
-3. **每两周 merge 一次上游**，别拖。现在落后 159 提交，越拖冲突越大。merge 后跑现有回归（187 项检查）。
-4. **优先缩小热点文件。** `generate.cpp` 的 +540 是最大单点，尽量把逻辑抽到独立头文件，让 `generate.cpp` 只剩参数解析与一次调用（`stage_ring.hpp` 已抽出 147 行，可以继续）。
+1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。这条纪律让分叉保持在 26 个文件。哪怕代码要贴着引擎写，宁可多一层接口。
+2. **保持加法为主。** 现在 +2971/−64。一旦开始大段重写上游代码，合并成本会失控。
+3. **每两周 merge 一次上游**，别拖。现在落后 159 提交。merge 后跑现有回归。
+4. **不要为了"整洁"重构不该重构的地方。** `generate.cpp` 末尾那 174 行 stage 实现看起来碍眼，但它和上游零重叠，抽出去的收益只有可读性。先看块级重叠，再决定是否动。
 5. **`#if defined(STRATA_GPU_METAL)` 是隔离带**，不是堆砌分支的地方。改 `verify.cpp` 时先确认改动落在哪个后端之下。
 6. **"分开"发生在发布层，不在代码层。** 打 tag、出独立构建产物（`tectonic-engine-vX`），但代码始终是同一 git 历史的 fork。这样既吃得上下游的量化 kernel 修复，又能让产品版本可控。物理复制引擎代码是最后手段——一旦复制，上游的 bug fix 就永远丢失。
 
 ## 待办
 
-- [ ] `4f25ec2a` / `677157af` / `a85fbcc0` / `ff277821` 评估合并成一个"layer-range execution"上游 PR 的可行性。
-- [ ] 把 `generate.cpp` 里的 ring 入口逻辑进一步外移。
+- [ ] **R4 前置**：`--agent` 路径没有并发也没有取消。`--serve` 有 slot 数组、batch window 和 `BSTOP`，但它的数据面是行协议；`--agent` 的数据面是边界帧。把调度的概念搬过来（不复制 serve 的代码，见规则 4 的反面：这是引擎能力，不是可读性重构）。
+- [ ] `kBoundaryEnd` 同时承担"数据帧+完成标记"与"控制广播"，v4 应考虑拆成 `End` 与 `Seal`。不做也能运行，是清晰度问题。
+- [ ] `4f25ec2a`、`677157af`、`a85fbcc0`、`ff277821`、`d065d8fd`、`89321c75`、`d354419b` 评估合并成一个上游 PR 的可行性。
 - [ ] 记录下一次与上游 merge 的日期与冲突文件。
