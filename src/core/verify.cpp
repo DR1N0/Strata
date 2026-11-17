@@ -10,6 +10,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/boundary_wire.hpp"
 #include "strata/core/window_evict.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -92,6 +93,9 @@
 namespace strata::metal_engine {
 void window_destroy(void* w);
 void* window_create();
+bool window_set_stage(void* w, int lo, int hi, const float* in, float* out, std::string& err);
+bool window_boundary_capture(void* w, float* r, float* bo, float* inj, int t, int64_t pos, std::string& err);
+bool window_boundary_apply(void* w, const float* r, const float* bo, const float* inj, int t, std::string& err);
 bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::SessionState& ss, int max_t, int64_t max_cells,
                  int64_t* n_vocab, std::string& err);
 bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err);
@@ -910,7 +914,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
 #if defined(STRATA_GPU_METAL)
+    if (le_ < 0) le_ = g.n_layers;
     if (metal_ == nullptr) metal_ = strata::metal_engine::window_create();
+    if (!strata::metal_engine::window_set_stage(metal_, (int) lb_, (int) le_, hand_in_, hand_out_, err)) return false;
     if (!strata::metal_engine::window_init(metal_, g, ss, max_t, ss.qsa_states[ss.qsa_primary()].max_cells, &n_vocab_, err)) return false;
     if (!tap_req_.empty()) {   // DFlash2: the Metal window writes the taps itself (metal/src/engine/dflash2.inc); tap_dev() is its unified-memory buffer
         const float* tp = nullptr;
@@ -945,14 +951,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     if (le_ < 0) le_ = g.n_layers;
-    if (lb_ < 0 || lb_ >= le_ || le_ > g.n_layers || (lb_ > 0 && hand_in_ == nullptr) ||
-        (le_ < g.n_layers && hand_out_ == nullptr)) {
+    // A STAGE OF A CROSS-MACHINE SPLIT HAS NO IN-PROCESS NEIGHBOUR: `hand_out_ == nullptr` with `le_ < n_layers`
+    // used to be refused, because a layer split inside one process must hand the residual to its next stage.
+    // Such a stage now leaves the residual in `R_` and the caller carries it out (`final_R_all()`), which is what
+    // a socket or a file needs; the multi-GPU shape still passes a real `hand_out_` and is unchanged.
+    if (lb_ < 0 || lb_ >= le_ || le_ > g.n_layers || (lb_ > 0 && hand_in_ == nullptr)) {
         err = "verify: the stage's layer range or its hand-off buffers are wrong";
         return false;
     }
+    // THE VOCABULARY SIZE, NOT THE HEAD: a stage that does not own the output projection (a head stage) has no
+    // `output.weight`, and it never samples anything - the geometry already carries the size the verifier needs.
     const WeightRef* wo = wt.find("output.weight");
-    if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
-    n_vocab_ = wo->ne1;
+    n_vocab_ = wo != nullptr ? wo->ne1 : g.n_vocab;
+    if (n_vocab_ <= 0) { err = "verify: output.weight is missing and the geometry has no vocabulary"; return false; }
 
     const strata::kernels::QsaShapes s = shapes_of(g);
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
@@ -1448,6 +1459,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
     const int64_t HB = Verifier::handoff_floats(g);
+    // Every nonzero stage starts from the previous stage's residual, including decode after prefill.
+    // Local K/V history does not replace the preceding layers' computation for the current token.
     if (lb_ > 0) {
         const float* hin = hand_in_ + (size_t) hrow0 * HB;   // the group's rows: [R][bo][inj] contiguous
         // the overlapped split: this graph was launched before the previous stage finished - wait for its hand-off
@@ -2528,6 +2541,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
+        if (hand_out_ == nullptr) return true;   // a stage alone in its process: `R_` holds the rows, the caller takes them
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         if (hflag_out_d_ != nullptr && !batch_rec_) {   // the overlapped split: payload + the next stage's flag
             handoff_publish(hout, R_, (int64_t) T * HC * N, bo_, (int64_t) T * N, inj2_, (int64_t) T * HC, hcount_d_,
@@ -4703,6 +4717,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     // each row runs in its slot's state and commits there (a one-token window); nothing is left for commit_slots
     if (S < 1 || S > (int) strata::kernels::kVerifyMaxT) { err = "verify: batch window size out of range"; return false; }
     (void) pool; (void) user;
+    progress_at("verify batch: waiting for Metal window", S);
     if (!strata::metal_engine::window_run_slots(metal_, rows, S, tokens, pos, out, err)) return false;
     last_t_ = S;
     for (int t = 0; t < S; ++t) { last_rows_[t] = rows[t]; last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
@@ -4721,6 +4736,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             if (!strata::metal_engine::window_sample_slot_row(metal_, t, sp, hist, hlen, &out[t], err)) return false;
         }
     }
+    // Metal returns before the CUDA/HIP completion heartbeat below. A live batch
+    // can outlast the serve watchdog's limit; only successful windows beat.
+    progress_at("decode");
+    progress_beat();
     return true;
 #endif
     using namespace strata::kernels;
@@ -5471,6 +5490,97 @@ void Verifier::absorb_stats(Verifier& o) {
         for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
     prof_windows_ += o.prof_windows_;
     o.prof_windows_ = 0;
+}
+
+// ---- THE BOUNDARY AS ONE OBJECT (boundary_wire.hpp) -------------------------------------------------
+//
+// A stage of a split in its own process reads and writes these instead of the in-process `hand_in_` /
+// `hand_out_` pointers.  The three tensors are the same ones the multi-GPU hand-off carries, named here
+// so a consumer takes the one it needs rather than guessing a stride.
+
+bool Verifier::boundary_capture(BoundaryFrame& f, int64_t T, int64_t pos0, void* stream, std::string& err) const {
+#if defined(STRATA_GPU_METAL)
+    (void) stream;
+    if (!g_ || !metal_ || T != 1 || le_ >= g_->n_layers) {
+        err = "boundary_capture: Metal needs an intermediate T=1 stage"; return false;
+    }
+    const int64_t N = g_->n_embd, HC = g_->hc;
+    if (!boundary_frame_alloc(f, T, {"R", "bo", "inj"}, {HC * N, N, HC})) {
+        err = "boundary_capture: bad window shape"; return false;
+    }
+    f.pos0 = pos0; f.layer_begin = lb_; f.layer_end = le_;
+    return strata::metal_engine::window_boundary_capture(metal_, f.storage.data(), f.storage.data() + HC * N,
+                                                       f.storage.data() + (HC + 1) * N, (int) T, pos0, err);
+#else
+    if (g_ == nullptr || R_ == nullptr || bo_ == nullptr || inj2_ == nullptr) {
+        err = "boundary_capture: the verifier is not initialized";
+        return false;
+    }
+    const int64_t N = g_->n_embd, HC = g_->hc;
+    if (!boundary_frame_alloc(f, T, {"R", "bo", "inj"}, {HC * N, N, HC})) {
+        err = "boundary_capture: bad window shape";
+        return false;
+    }
+    f.pos0 = pos0;
+    f.layer_begin = lb_;
+    f.layer_end = le_;
+    cudaStream_t cs = (cudaStream_t) stream;
+    cudaError_t e = cudaMemcpyAsync(f.storage.data(), R_, (size_t) T * HC * N * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(f.storage.data() + (size_t) T * HC * N, bo_, (size_t) T * N * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(f.storage.data() + (size_t) T * (HC + 1) * N, inj2_, (size_t) T * HC * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+    if (e == cudaSuccess && stream != nullptr) e = cudaStreamSynchronize(cs);
+    if (e != cudaSuccess) {
+        err = std::string("boundary_capture: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+#endif
+}
+
+bool Verifier::boundary_apply(const BoundaryFrame& f, int64_t T, void* stream, std::string& err) {
+#if defined(STRATA_GPU_METAL)
+    (void) stream;
+    if (!g_ || !metal_ || T != 1 || lb_ <= 0 || f.layer_end != lb_) {
+        err = "boundary_apply: Metal needs a contiguous incoming T=1 frame"; return false;
+    }
+    const BoundaryTensor *r = f.find("R"), *b = f.find("bo"), *i = f.find("inj");
+    if (!r || !b || !i || !r->host || !b->host || !i->host || r->rows != T || b->rows != T || i->rows != T ||
+        r->elems_per_row != g_->hc * g_->n_embd || b->elems_per_row != g_->n_embd || i->elems_per_row != g_->hc) {
+        err = "boundary_apply: the frame's tensors do not fit this verifier"; return false;
+    }
+    return strata::metal_engine::window_boundary_apply(metal_, r->host, b->host, i->host, (int) T, err);
+#else
+    if (g_ == nullptr || R_ == nullptr || bo_ == nullptr || inj2_ == nullptr) {
+        err = "boundary_apply: the verifier is not initialized";
+        return false;
+    }
+    const int64_t N = g_->n_embd, HC = g_->hc;
+    const BoundaryTensor* r = f.find("R");
+    const BoundaryTensor* b = f.find("bo");
+    const BoundaryTensor* i = f.find("inj");
+    if (r == nullptr || b == nullptr || i == nullptr || r->rows != T || r->elems_per_row != HC * N ||
+        b->elems_per_row != N || i->elems_per_row != HC) {
+        err = "boundary_apply: the frame's tensors do not fit this verifier";
+        return false;
+    }
+    cudaStream_t cs = (cudaStream_t) stream;
+    cudaError_t e = cudaMemcpyAsync(R_, r->host, (size_t) T * HC * N * sizeof(float), cudaMemcpyHostToDevice, cs);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(bo_, b->host, (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice, cs);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(inj2_, i->host, (size_t) T * HC * sizeof(float), cudaMemcpyHostToDevice, cs);
+    if (e == cudaSuccess && stream != nullptr) e = cudaStreamSynchronize(cs);
+    if (e != cudaSuccess) {
+        err = std::string("boundary_apply: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+#endif
 }
 
 }  // namespace strata::core

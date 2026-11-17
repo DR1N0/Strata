@@ -17,6 +17,7 @@
 #include "ref_quant.h"
 #include "arena_budget.h"
 #include "stream.h"
+#include "stage.h"
 #include "geo.h"
 #include "msl_libs.h"
 #include "../../tests/coop_probe.h"
@@ -54,6 +55,7 @@ namespace strata::gpu { void* host_view(const void* device_pointer); }
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <thread>
 #include <vector>
 
@@ -239,6 +241,18 @@ class Window {
 public:
     bool init(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const std::string& shard1, int max_t,
               int64_t max_cells, std::string& err);
+    bool set_stage(int lo, int hi, const float* in, float* out, std::string& err) {
+        StagePlan plan;
+        if (!plan.configure(lo, hi, G_NL, G_QI, in != nullptr, err)) return false;
+        if (ready() && (plan.begin != stage_.begin || plan.end != stage_.end)) {
+            err = "metal stage: cannot change an initialized window's range"; return false;
+        }
+        stage_ = plan; hand_in_ = in; hand_out_ = out;
+        return true;
+    }
+    bool last_stage() const { return stage_.last(); }
+    bool boundary_capture(float* r, float* bo, float* inj, int t, int64_t pos, std::string& err) const;
+    bool boundary_apply(const float* r, const float* bo, const float* inj, int t, std::string& err);
     bool run(int T, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err);
     bool commit(int n_keep, std::string& err);
     bool finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, double t0);
@@ -372,6 +386,14 @@ private:
         return it->second;
     }
 
+    StagePlan stage_{0, G_NL, G_NL};
+    const float* hand_in_ = nullptr;
+    float* hand_out_ = nullptr;
+    bool boundary_ready_ = false, boundary_applied_ = false;
+    // Set for the duration of a prompt run: this stage's handoff input, n rows (null on the entry stage). The decode
+    // path's one-row `hand_in_` cannot carry a chunk.
+    const float* prompt_hand_ = nullptr;
+    int64_t boundary_pos_ = -1;
     strata::core::SessionState* ss_ = nullptr;        // the session whose sequence the live state is (the main one, or a batch slot's)
     strata::core::SessionState* main_ss_ = nullptr;   // the main session: it owns the PLE table (read by every slot)
     gguf::File f_;
@@ -455,6 +477,10 @@ private:
     }
     bool run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
     bool finish_rows(int S, const int32_t* tokens, int32_t* out, double t0);
+    void batch_evidence(const int* rows, int S, bool ran_rows);
+    uint64_t batch_evidence_windows_ = 0;
+    bool batch_evidence_rows_ = false;
+    std::vector<int> batch_evidence_slots_;
     struct SeqSet {
         std::vector<mtl::Buffer> gst, gh0, gh1, kq, vq, ksc, vsc, tail, dead, pooled;
         mtl::Buffer pleHist;
@@ -526,6 +552,12 @@ public:
     bool prompt_gemm_init(std::string& err);
     bool prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err);
     int prompt_chunk_rows() const;
+    float* prompt_rows_ptr();
+    // The prompt entry points are free functions, so the stage's handoff rows are published through this and not
+    // through friendship: one pointer in, cleared on the way out.
+    void set_prompt_hand(const float* h) { prompt_hand_ = h; }
+    // The rows of the last window this object ran (R_), for the fallback prompt path that steps MAXT at a time.
+    float* window_rows_ptr() { return R_.as<float>(); }
     void prompt_region(bool hold) { if (stream_ && st_ && st_->ready()) st_->hold_region(hold); }
     void stream_report(FILE* f) const {
         if (!st_) return;
@@ -538,8 +570,10 @@ public:
     int win_n_[MAXT + 1] = {};
     double win_ms_[MAXT + 1] = {}, win_gpu_[MAXT + 1] = {};
     void at_cut(int s) {
-        st_->at_layer(s, seg_T_, TOPK, cut_ids_ ? cut_ids_ : ids_.as<int32_t>(), st_pred_ && !cut_ids_ ? predL_.as<float>() + (size_t) s * MAXT * 512 : nullptr,
-                      predL2_.ptr && !cut_ids_ ? predL2_.as<float>() + (size_t) s * MAXT * 512 : nullptr);
+        const int l = stage_.stream_layer(s);
+        st_->at_layer(l, seg_T_, TOPK, cut_ids_ ? cut_ids_ : ids_.as<int32_t>(),
+                      st_pred_ && !cut_ids_ && l + 1 < stage_.end ? predL_.as<float>() + (size_t) l * MAXT * 512 : nullptr,
+                      predL2_.ptr && !cut_ids_ && l + 2 < stage_.end ? predL2_.as<float>() + (size_t) l * MAXT * 512 : nullptr);
     }
 private:
     std::vector<float> ple_hist_;    // NG_HIST x hc_dim normalized rows, row-fastest
@@ -920,7 +954,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
                         for (int c = nexp_; c < NEXP; ++c) pb->as<float>()[r * 512 + c] = -INFINITY;
         }
     }
-    ple_on_ = ss.ple.ready() && f_.find("blk.1.ple_key.weight") != nullptr;
+    ple_on_ = stage_.first() && stage_.end > 1 && ss.ple.ready() && f_.find("blk.1.ple_key.weight") != nullptr;
     if (ple_on_ && T("blk.1.ple_conv1d.weight").type == ref::F32) {
         const gguf::Tensor& k = T("blk.1.ple_conv1d.weight");
         const size_t ne = k.bytes / 4;
@@ -1210,11 +1244,11 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     const gguf::Tensor& trt = T(b + "ffn_gate_inp.weight");
     gemv(ds, trt, XF_, logits_, 512, ntok);
     nb_ = true;
-    if (stream_ && st_pred_ && l + 1 < G_NL) {   // the next layer's routing guessed from this layer's FFN input
+    if (stream_ && st_pred_ && l + 1 < stage_.end) {   // the next layer's routing guessed from this layer's FFN input
         nb_ = true;   // beside the router GEMV
         gemv(ds, T("blk." + std::to_string(l + 1) + ".ffn_gate_inp.weight"), XF_, predL_, 512, ntok,
              (size_t) l * MAXT * 512 * 4);
-        if (predL2_.ptr && l + 2 < G_NL) {
+        if (predL2_.ptr && l + 2 < stage_.end) {
             nb_ = true;
             gemv(ds, T("blk." + std::to_string(l + 2) + ".ffn_gate_inp.weight"), XF_, predL2_, 512, ntok,
                  (size_t) l * MAXT * 512 * 4);
@@ -1404,11 +1438,42 @@ void Window::ple_cpu(int Tn) {
     }
 }
 
+bool Window::boundary_capture(float* r, float* bo, float* inj, int t, int64_t pos, std::string& err) const {
+    if (!boundary_ready_ || t != 1 || pos != boundary_pos_) {
+        err = "metal boundary: no matching completed intermediate T=1 window"; return false;
+    }
+    std::memcpy(r, R_.ptr, (size_t) HC * N * sizeof(float));
+    std::memcpy(bo, bo_.ptr, (size_t) N * sizeof(float));
+    std::memcpy(inj, inj_[0].ptr, (size_t) HC * sizeof(float));
+    return true;
+}
+bool Window::boundary_apply(const float* r, const float* bo, const float* inj, int t, std::string& err) {
+    if (!ready() || stage_.first() || t != 1) {
+        err = "metal boundary: apply requires an initialized non-first T=1 stage"; return false;
+    }
+    std::memcpy(R_.ptr, r, (size_t) HC * N * sizeof(float));
+    std::memcpy(bo_.ptr, bo, (size_t) N * sizeof(float));
+    std::memcpy(inj_[0].ptr, inj, (size_t) HC * sizeof(float));
+    boundary_applied_ = true;
+    boundary_ready_ = false;
+    return true;
+}
+
 bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err) {
     mtp_src_ = nullptr;
     if (Tn < 1 || Tn > MAXT || (head && Tn > max_t_)) { err = "metal window: window size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal window: the window runs past the context"; return false; }
+    if (!stage_.window(Tn, rows_, err)) return false;
+    boundary_ready_ = false;
+    head = head && stage_.last();
     const double t0 = now_ms();
+    // A non-first stage consumes the preceding FFN write as well as R. Both
+    // injection buffers start at parity zero, matching graph construction/cache.
+    if (!stage_.first()) {
+        if (!boundary_applied_)
+            stage_import(hand_in_, R_.as<float>(), bo_.as<float>(), inj_[0].as<float>(), Tn, N, HC);
+        boundary_applied_ = false;
+    } else {
     // ---- the embeddings (CPU dequant of the token rows straight into the shared buffer), broadcast to the streams
     const gguf::Tensor& te = T("token_embd.weight");
     const size_t rb = ref::row_bytes(te.type, N);
@@ -1417,6 +1482,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         if (const float* img = img_row(pos0 + t)) std::memcpy(r, img, (size_t) N * 4);
         else ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
         for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
+    }
     }
     // ---- the PLE rows (the table read is the shared host code's), projected on the GPU
     if (ple_on_) {
@@ -1491,7 +1557,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         gemv(ds, T("blk.1.ple_value.weight"), XE_, pval_, N, Tn);
     }
     cur_inj_ = 0;
-    layer(ds, 0, Tn, pos0);
+    layer(ds, stage_.begin, Tn, pos0);
     if (ple_on_) {
         // layer 0's FFN write applied to R (gr_norm with apply writes R back; its xn is not used)
         const gguf::Tensor& tn = T("blk.1.hc_attn_norm.weight");
@@ -1529,9 +1595,10 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         g4.grid[0] = HC * N / 256; g4.grid[1] = Tn; g4.tg[0] = 256;
         push(ds, g4);
     }
-    for (int l = 1; l < G_NL; ++l) layer(ds, l, Tn, pos0);
-    // ---- the final mixer and the head
-    gr_read(ds, "output_hc", true, XA_, true, Tn);
+    for (int l = stage_.begin + 1; l < stage_.end; ++l) layer(ds, l, Tn, pos0);
+    // Do NOT fold the last pending FFN on an intermediate stage. Its successor's
+    // first gr_read performs that fold, exactly as in the unsplit chain.
+    if (stage_.last()) gr_read(ds, "output_hc", true, XA_, true, Tn);
     if (head) gemv(ds, T("output.weight"), XA_, lm_, (size_t) n_vocab_, Tn);
     if (head) {
         ArgArgs a{(uint32_t) n_vocab_, 120};
@@ -1980,6 +2047,13 @@ void Window::print_prof(bool periodic) {
 }
 
 bool Window::finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, double t0) {
+    if (!stage_.last()) {
+        // run_graph has waited for completion; these buffers are shared memory.
+        boundary_ready_ = true;
+        boundary_pos_ = pos0;
+        if (hand_out_)
+            stage_export(hand_out_, R_.as<float>(), bo_.as<float>(), inj_[0].as<float>(), Tn, N, HC);
+    }
     ++win_n_[Tn];
     win_ms_[Tn] += now_ms() - t0;
     win_gpu_[Tn] += last_gpu_ms_;
@@ -2118,6 +2192,7 @@ void Window::alloc_set(SeqSet& o, bool real, int idx) {
 }
 
 bool Window::slots_init(const std::vector<strata::core::SessionState*>& slots, std::string& err) {
+    if (stage_.split()) { err = "metal stage: batch slots are not supported by L0"; return false; }
     if (!sets_.empty()) return true;   // (asked once)
     if (cx_ == nullptr) { err = "metal window: slots before the window is up"; return false; }
     std::vector<std::unique_ptr<SeqSet>> v;
@@ -2156,12 +2231,47 @@ void Window::activate(int set) {
     active_ = set;
 }
 
+// Opt-in evidence of completed batch dispatches, not an atexit report (stdio serve uses _Exit).
+// Disabled: no counters, allocations, clock reads or output. Enabled: no added GPU work or synchronization.
+void Window::batch_evidence(const int* rows, int S, bool ran_rows) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("STRATA_METAL_BATCH_EVIDENCE");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    if (!enabled || S < 1) return;
+    ++batch_evidence_windows_;   // one successful run_slots dispatch, including the explicit serial fallback
+    const bool changed = batch_evidence_slots_.size() != (size_t) S || batch_evidence_rows_ != ran_rows ||
+                         !std::equal(batch_evidence_slots_.begin(), batch_evidence_slots_.end(), rows);
+    if (!changed && batch_evidence_windows_ % 64 != 0) return;
+    if (changed) {
+        batch_evidence_slots_.assign(rows, rows + S);
+        batch_evidence_rows_ = ran_rows;
+    }
+    // Python time.monotonic() on macOS uses this same Mach clock and timebase, not an assumed now_ms() epoch.
+    static const double seconds_per_tick = [] {
+        mach_timebase_info_data_t tb = {};
+        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.denom == 0) return 0.0;
+        return (double) tb.numer / (double) tb.denom / 1e9;
+    }();
+    if (seconds_per_tick == 0.0) return;
+    const double t = (double) mach_absolute_time() * seconds_per_tick;
+    std::string slots;
+    for (int i = 0; i < S; ++i) {
+        if (i) slots += ',';
+        slots += std::to_string(rows[i]);
+    }
+    std::fprintf(stderr, "METAL_BATCH_EVIDENCE t=%.9f windows=%llu path=%s width=%d slots=%s\n",
+                 t, (unsigned long long) batch_evidence_windows_, ran_rows ? "rows" : "serial", S, slots.c_str());
+}
+
 bool Window::run_slots(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err) {
     if (sets_.empty()) { err = "metal window: no batch slots"; return false; }
     static const bool one_window = !(std::getenv("STRATA_METAL_BATCH_ROWS") && std::string(std::getenv("STRATA_METAL_BATCH_ROWS")) == "0");
     if (one_window && bigs_ok_) {
         activate(0);
-        return run_rows(rows, S, tokens, pos, out, err);
+        const bool ok = run_rows(rows, S, tokens, pos, out, err);
+        if (ok) batch_evidence(rows, S, true);
+        return ok;
     }
     bool ok = true;
     for (int t = 0; t < S && ok; ++t) {
@@ -2172,6 +2282,7 @@ bool Window::run_slots(const int* rows, int S, const int32_t* tokens, const int6
         ok = run(1, tokens + t, pos[t], true, out + t, err) && commit(1, err);
     }
     activate(0);
+    if (ok) batch_evidence(rows, S, false);
     return ok;
 }
 
@@ -2231,9 +2342,9 @@ static void bind_qsa(strata::core::QsaState& st, const mtl::Buffer& kq, const mt
 void Window::bind_session(strata::core::SessionState& ss) {
     if (!ss.qsa_states) return;
     const int64_t n = ss.qsa_alloc, o = ss.qsa_ord0;
-    if (n != (int64_t) kq_.size() || o != 0) return;   // a carved session: not this window's whole model
-    for (int64_t j = 0; j < n; ++j)
-        bind_qsa(ss.qsa_states[(size_t) (o + j)], kq_[(size_t) j], vq_[(size_t) j], ksc_[(size_t) j], vsc_[(size_t) j],
+    if (o < 0 || n < 0 || o + n > (int64_t) kq_.size()) return;
+    for (int64_t j = o; j < o + n; ++j)
+        bind_qsa(ss.qsa_states[(size_t) j], kq_[(size_t) j], vq_[(size_t) j], ksc_[(size_t) j], vsc_[(size_t) j],
                  &pooled_[(size_t) j], &tail_[(size_t) j], &dead_[(size_t) j], max_cells_);
 }
 
@@ -2274,6 +2385,8 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
 }
 
 void Window::reset() {
+    boundary_ready_ = boundary_applied_ = false;
+    boundary_pos_ = -1;
     pend_fold_ = 0;
     last_T_ = 0;
     auto zero = [](const mtl::Buffer& b, size_t n) { std::memset(b.ptr, 0, n); };
@@ -2356,6 +2469,7 @@ bool Window::commit(int n_keep, std::string& err) {
 
 // ================================================================================================ the MTP draft layer
 bool Window::mtp_load(const std::string& gguf_path, int max_t, std::string& err) {
+    if (stage_.split()) { err = "metal stage: MTP is not supported by L0"; return false; }
     (void) max_t;
     if (!fm_.open(gguf_path, err)) return false;
     madvise(fm_.map, fm_.map_bytes, MADV_WILLNEED);
@@ -2892,6 +3006,9 @@ struct Window::PromptGemm {
 };
 
 int Window::prompt_chunk_rows() const { return pg_ ? pg_->MT : 0; }
+// The chunk's residual rows, one row per token in the chunk - what a split stage sends onward. Device pointer, the
+// same thing the CUDA path hands a prompt chunk's consumer; valid until the next chunk starts.
+float* Window::prompt_rows_ptr() { return pg_ ? pg_->R.as<float>() : nullptr; }
 
 bool Window::prompt_gemm_on(int64_t n) const {
     static const bool on = [] {
@@ -3015,8 +3132,14 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         pend_fold_ = 0;
     }
     const int T = Tn;
-    // ---- the embeddings into every stream, the PLE rows
-    {
+    // A window that was never given a stage is a whole-model window: stage_ defaults to an empty range, and reading
+    // it literally would silently compute zero layers. Anything that did not call set_stage keeps the old behaviour.
+    const bool staged = stage_.layers > 0;
+    const int LB = staged ? stage_.begin : 0;
+    const int LE = staged ? stage_.end : G_NL;
+    // ---- the rows: this stage's entry point. Only the stage that owns layer 0 embeds tokens; every other stage
+    // continues from the residual rows its predecessor handed over, one row per token.
+    if (LB == 0) {
         const gguf::Tensor& te = TN("token_embd.weight");
         const size_t rb = ref::row_bytes(te.type, N);
         mrope_sync(pos0, T);
@@ -3026,9 +3149,19 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             else ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
             for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
         }
+    } else if (prompt_hand_ != nullptr) {
+        // THE CHUNK'S OWN SLICE. prompt_hand_ holds the whole prompt's rows from position 0, so chunk at pos0 reads
+        // from pos0 rows in - copying from the base every time would make every chunk start with the first chunk's
+        // tokens, which is wrong for any prompt longer than one chunk.
+        std::memcpy(p.R.as<float>(), prompt_hand_ + (size_t) pos0 * (size_t) HC * N,
+                    (size_t) T * HC * N * sizeof(float));
+    } else {
+        err = "metal prompt: a non-entry stage has no handoff rows"; return false;
     }
+    // PLE belongs to the stage that owns layer 1.
+    const bool ple_here = ple_on_ && LB <= 1 && 1 < LE;
     strata::core::SessionState& ss = *ss_;
-    if (ple_on_) {
+    if (ple_here) {
         std::vector<uint32_t> rows((size_t) T * strata::kernels::PLE_N_HEADS);
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
@@ -3093,7 +3226,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         ci = 1 - ci;
     };
     // the PLE projections (the window's gemv pair as GEMMs)
-    if (ple_on_) {
+    if (ple_here) {
         act16(p.emb, p.embh, (size_t) T * N);
         dq(TN("blk.1.ple_key.weight"), p.Wpk);
         dq(TN("blk.1.ple_value.weight"), p.Wpv);
@@ -3102,7 +3235,8 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     }
     const int MB = (int) max_cells_ / 4 + 2;
     (void) MB;
-    for (int l = 0; l < G_NL; ++l) {
+    // THIS STAGE'S LAYERS ONLY: see pc_chunk above. The rows handed out below are what the next stage continues from.
+    for (int l = LB; l < LE; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
         hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_));
         if (l % 4 != 3) {
@@ -3481,6 +3615,15 @@ void window_destroy(void* w) {
         window_register(nullptr);
     }
 }
+bool window_set_stage(void* w, int lo, int hi, const float* in, float* out, std::string& err) {
+    return ((Window*) w)->set_stage(lo, hi, in, out, err);
+}
+bool window_boundary_capture(void* w, float* r, float* bo, float* inj, int t, int64_t pos, std::string& err) {
+    return ((Window*) w)->boundary_capture(r, bo, inj, t, pos, err);
+}
+bool window_boundary_apply(void* w, const float* r, const float* bo, const float* inj, int t, std::string& err) {
+    return ((Window*) w)->boundary_apply(r, bo, inj, t, err);
+}
 bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::SessionState& ss, int max_t, int64_t max_cells,
                  int64_t* n_vocab, std::string& err) {
     Window* x = (Window*) w;
@@ -3509,8 +3652,9 @@ bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, 
     // windows that sample nothing (head_sampling off)
     static const bool logpos = std::getenv("STRATA_LOGPOS") != nullptr;
     Window* win = (Window*) w;
-    if (!win->run(T, tokens, pos0, head || logpos, out, err)) return false;
-    return !head || win->sample_rows(T, out, err);   // a sampled / penalised / biased request: the head rows' tokens by the sampler chain (nothing to do for greedy)
+    const bool sample = head && win->last_stage();
+    if (!win->run(T, tokens, pos0, (head || logpos) && win->last_stage(), out, err)) return false;
+    return !sample || win->sample_rows(T, out, err);   // a sampled / penalised / biased request: the head rows' tokens by the sampler chain (nothing to do for greedy)
 }
 void window_reset(const strata::core::SessionState* ss) {
     if (g_the_window == nullptr || !g_the_window->ready()) return;
@@ -3587,16 +3731,26 @@ bool mtp_load_pending(Window* w, std::string& err) {
 // Prefill::run's Metal side: the prompt read through the window, MAXT rows at a time (no head), each window
 // committed; on_chunk (the MTP's K/V) after each, with the window's final residual rows in place.
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
+                const float* hand_rows,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
 bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
+                const float* hand_rows,
                 const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     struct Rows {
         explicit Rows(const float* const* r) { g_embd_rows = r; }
         ~Rows() { g_embd_rows = nullptr; }
     } rows(embd_rows);
-    return prompt_run_rows(tokens, n, pos0, on_chunk, err);
+    // The stage's handoff rows are held here for the duration of the prompt: every chunk function already reads the
+    // window, and threading one more argument through prompt()/pc_chunk()/prompt_chunk() would add three signatures
+    // for one pointer. Cleared on every exit.
+    struct Hand {
+        explicit Hand(const float* h) { g_window->set_prompt_hand(h); }
+        ~Hand() { g_window->set_prompt_hand(nullptr); }
+    } hand(hand_rows);
+    return prompt_run_rows(tokens, n, pos0, hand_rows, on_chunk, err);
 }
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
+                const float* hand_rows,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
     static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
@@ -3615,7 +3769,10 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
             for (int64_t c = 0; c < n && ok; c += C) {
                 const int k = (int) std::min<int64_t>(C, n - c);
                 for (int i = 0; i < k; ++i) tk32[(size_t) i] = (int32_t) tokens[c + i];
-                ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err) && (!on_chunk || on_chunk(nullptr, k, pos0 + c, err));
+                ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err);
+                // Same hand-off as prompt() above: the streaming path's chunk residuals live in `pg_->R`, and a
+                // split stage needs them. Null here was the other half of the same defect.
+                if (ok && on_chunk) ok = on_chunk(g_window->prompt_rows_ptr(), k, pos0 + c, err);
             }
             g_window->prompt_region(false);
             return ok;
@@ -3627,7 +3784,7 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
         for (int i = 0; i < k; ++i) tk[i] = (int32_t) tokens[c + i];
         if (!g_window->run(k, tk, pos0 + c, false, out, err) || !g_window->commit(k, err)) return false;
         if (!g_window->tap_deliver_dec(k, pos0 + c, err)) return false;   // DFlash2
-        if (on_chunk && !on_chunk(nullptr, k, pos0 + c, err)) return false;
+        if (on_chunk && !on_chunk(g_window->window_rows_ptr(), k, pos0 + c, err)) return false;
     }
     return true;
 }

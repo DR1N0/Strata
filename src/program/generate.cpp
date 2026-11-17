@@ -63,6 +63,9 @@
 #include "strata/core/kv_grow_rules.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/boundary_wire.hpp"
+#include "strata/core/boundary_socket.hpp"
+#include "stage_worker.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -738,6 +741,42 @@ struct Options {
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
     int64_t max_context = 4096;
+    /// A STAGE OF A SPLIT, RUN IN THIS PROCESS: the layers this process owns, `[layer_begin, layer_end)`.
+    /// `layer_end < 0` is the whole model (every caller before this).  The session carves only this range
+    /// (session_init) and the graphs cover only it (session_capture).  Set only by `--layers LO,HI`
+    /// (Tectonic, below) - one argument, so "forgot one bound" cannot be expressed in the syntax.
+    int64_t layer_begin = 0;
+    int64_t layer_end = -1;
+    // --stage-input (Tectonic: removed) used to let a non-entry, single-process stage replay its input residual
+    // from a file instead of a live upstream. Confirmed unneeded for the network-driven --tectonic mode, which
+    // gets its input over the wire instead; removed rather than kept as dead code.
+    /// THE SPLIT'S WIRING, ONE LISTENING PORT AND TWO DESTINATIONS PER STAGE.
+    ///
+    /// A stage listens on its own port (its ingress: prompts and rows from its upstream) and connects out
+    /// twice: `--downstream` (rows for the next stage, or the token for a tail stage) and `--orch` (only the
+    /// head: the sampled tokens, for whatever drove the request).  The senders do not bind a port - TCP picks
+    /// an ephemeral one - so nothing but the listen port can collide, which matters while both stages run on
+    /// one machine.  A ring, not a pipeline: a tail stage's downstream is the head's ingress.
+    ///
+    /// (The three fields below are not part of the ring wiring described above - that paragraph is about the
+    /// --listen/--downstream/--orch ring, which this fork removed. They are Tectonic's own addition.)
+    //
+    // Tectonic: --tectonic is the mode switch (bare, no value), separate on purpose from the fields it
+    // requires (worker_data_endpoint, worker_signal_endpoint, instance_id, plus an explicit --layers range).
+    // The engine used to treat "was --agent given a value" as the mode switch, which meant a typo'd or missing
+    // flag fell through to a different top-level mode silently instead of failing loudly. See the --tectonic
+    // dispatch below for the hard-error check this buys.
+    bool tectonic = false;
+    // Tectonic: was --agent HOST:PORT; renamed because "agent" is retired Tectonic-side terminology (it used
+    // to mean this process itself) and collides with "AI agent" in today's usage. The daemon's data
+    // connection: gen/delta/done/error and the hello handshake.
+    std::string worker_data_endpoint;
+    // Tectonic: new. The daemon's signal connection: cancel/shutdown, kept off the data connection so a
+    // cancel is never queued behind a multi-MB prefill frame.
+    std::string worker_signal_endpoint;
+    // Tectonic: new. Echoed into hello so the daemon can tell this instance apart from a leftover one on the
+    // same port.
+    std::string instance_id;
     bool greedy = true;
     uint64_t seed = 0;
     int top_k = 20;
@@ -3694,6 +3733,26 @@ int main(int argc, char** argv) {
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
+        // Tectonic: --layers LO,HI is the only way to set this pair now (confirmed via git history that
+        // --stage-begin/--stage-end were never upstream's - a85fbcc0 on this fork's own branch introduced
+        // them alongside the now-removed --stage-input, for the same single-process layer-splitting feature
+        // --tectonic later superseded). One argument, so "forgot one bound" cannot be expressed in the syntax.
+        else if (a == "--layers") {
+            const char* v = next("--layers");
+            const char* comma = std::strchr(v, ',');
+            if (comma == nullptr) {
+                std::fprintf(stderr, "strata generate: --layers wants LO,HI, got %s\n", v);
+                return 2;
+            }
+            o.layer_begin = std::atoll(v);
+            o.layer_end = std::atoll(comma + 1);
+        }
+        // Tectonic: --tectonic is the mode switch; see its field comment above for why it is separate from
+        // --worker-data-endpoint instead of the old single "--agent HOST:PORT" that was both at once.
+        else if (a == "--tectonic") o.tectonic = true;
+        else if (a == "--worker-data-endpoint") o.worker_data_endpoint = next("--worker-data-endpoint");
+        else if (a == "--worker-signal-endpoint") o.worker_signal_endpoint = next("--worker-signal-endpoint");
+        else if (a == "--instance-id") o.instance_id = next("--instance-id");
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
         else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
         else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(next("--rope-freq-base"));
@@ -5037,7 +5096,11 @@ int main(int argc, char** argv) {
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
         const strata::core::ModelGeometry& g0 = strata::core::kCompiledGeometry;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        // A stage pack holds only the layers this process computes, so the index is loaded for that range and the
+        // blob offsets inside it start at zero again.
+        const int64_t el_begin = o.layer_end >= 0 ? o.layer_begin : 0;
+        const int64_t el_end = o.layer_end >= 0 ? o.layer_end : -1;
+        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err, el_begin, el_end)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -5688,7 +5751,10 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+        // A STAGE LOADS ONLY ITS OWN LAYERS' DENSE WEIGHTS: `load` filters by [layer_lo, layer_hi), and passing
+        // the whole range made a head pack fail on a tensor of the first layer it does not own.
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, o.layer_begin,
+                              o.layer_end >= 0 ? o.layer_end : -1)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
@@ -6286,7 +6352,8 @@ int main(int argc, char** argv) {
         }
         st.arena = arena_s;
         st.arena_bytes = pool_bytes;
-        if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
+        if (!o.native_dense_gguf.empty() &&
+            !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key, st.lb, st.le)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
             return false;
@@ -7301,7 +7368,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, o.layer_begin, o.layer_end >= 0 ? o.layer_end : hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -7843,9 +7910,11 @@ int main(int argc, char** argv) {
     // good at its first verify window.  Loaded first, the cache is sized around it.  #620: and before the expert
     // arena registers tens of GiB of host pages, like the drafter above - WDDM then refused the head's cudaMalloc on
     // a 16 GB card with the desktop on the iGPU ("native head upload: out of memory" with GiBs free).
+    // THE VOCABULARY SIZE: a head stage owns `output.weight`, a tail stage reads it natively, but a stage that owns
+    // neither still needs the size (it samples nothing and its head layer is absent) - the geometry has it.
     const strata::core::WeightRef* wo = wt.find("output.weight");
-    if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
-    const int64_t n_vocab = wo->ne1;
+    const int64_t n_vocab = wo != nullptr ? wo->ne1 : g.n_vocab;
+    if (n_vocab <= 0) { std::fprintf(stderr, "strata generate: output.weight is missing and the geometry has no vocabulary\n"); return 1; }
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
@@ -9823,8 +9892,8 @@ int main(int argc, char** argv) {
         // a layer split's CUDA0 session owns only [0, split_at[0]), so its graphs cover that range; the
         // whole-model replay paths (`session_loop`, the plain generate loop) refuse rather than read another
         // stage's state - a split runs its layers on the stages' verifiers (serve) or prefill stage chain
-        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, 0,
-                                           multi_gpu ? split_at[0] : -1)) {
+        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages,
+                                           o.layer_begin, o.layer_end >= 0 ? o.layer_end : (multi_gpu ? split_at[0] : -1))) {
             std::fprintf(stderr, "strata generate: session_capture: %s\n", err.c_str());
             return 1;
         }
@@ -12155,6 +12224,11 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            // A STAGE ALONE IN ITS PROCESS: the prompt path must not walk the layers the session did not carve.
+            // `session_init` gave it [layer_begin, layer_end)'s QSA states and GDN rows only, so a walk to
+            // `n_layers` would read states that were never initialized (and did: the batch indexer threw on a
+            // null one).  `-1` for the end means "to the last layer", which is the whole-model default.
+            else if (o.layer_end >= 0) sp.set_stage(o.layer_begin, o.layer_end >= g.n_layers ? -1 : o.layer_end, nullptr);
             if (share_pool) sp.set_cpu_pool(&pool);
             int cur_dev = 0;
             cudaGetDevice(&cur_dev);   // the device this path is about to run on (dev -1: the current one)
@@ -21547,9 +21621,210 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Network workers use one explicit state machine (stage_worker_run), not two autonomous speculative
+    // loops the way --serve's batch_step does - the old ring topology this comment used to describe by
+    // name (--listen/--downstream/--orch) was removed; "ring" here would now just mean the state machine.
+    // T=1 includes prompt positions: a correctness baseline; batched prefill is a later optimization.
+    if (o.tectonic) {
+        // Tectonic: --tectonic chose this branch; everything it needs is a hard error here rather than a
+        // silent fall-through to a different mode. This is the point of splitting the mode switch from its
+        // parameters - see the --tectonic field comment.
+        if (o.worker_data_endpoint.empty() || o.worker_signal_endpoint.empty() || o.instance_id.empty()) {
+            std::fprintf(stderr, "stage: --tectonic requires --worker-data-endpoint, --worker-signal-endpoint "
+                                 "and --instance-id\n");
+            return 2;
+        }
+        if (multi_gpu || o.layer_end < 0) {
+            std::fprintf(stderr, "stage: explicit stage range required (--layers); local multi-GPU not supported\n");
+            return 2;
+        }
+        const int64_t stage_hb = strata::core::Verifier::handoff_floats(g);
+        float* stage_hand = nullptr;
+        if (cudaHostAlloc((void**)&stage_hand, (size_t)stage_hb * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
+            std::fprintf(stderr, "stage: cannot allocate mapped boundary buffer\n"); return 1;
+        }
+        struct StageHandGuard { float* p; ~StageHandGuard() { cudaFreeHost(p); } } stage_guard{stage_hand};
+        strata::core::Verifier stage_ver;
+        strata::core::VerifyHits stage_hits;
+        stage_hits.d_res = thits.d_res;
+        stage_hits.h_res = host_res.empty() ? nullptr : host_res.data();
+        stage_hits.cache_base = thits.cache_base;
+        stage_hits.blob = thits.blob;
+        stage_hits.slot_off = xcache.slot_offsets();
+        stage_hits.n_slots = xcache.slots();
+        stage_ver.set_stage(o.layer_begin, o.layer_end, o.layer_begin > 0 ? stage_hand : nullptr, nullptr);
+        if (!stage_ver.init(wt, g, ss, stage_hits, native_head.loaded() ? &native_head : nullptr, 2, err)) {
+            std::fprintf(stderr, "stage: verifier init: %s\n", err.c_str()); return 1;
+        }
+        stage_ver.set_sampling(sp);
+        // THE PROMPT PATH FOR THIS STAGE. `Verifier::run` tops out at kWindowMaxT (8-16 rows) because that is a
+        // decode window, so a prompt cannot go through it without degenerating to one position per frame. Prefill
+        // is the engine's chunked reader: given the whole prompt it walks it in chunks and hands each chunk's rows
+        // over, which is the only shape whose cost tracks chunks instead of tokens.
+        strata::program::StageWorkerStats worker_stats;
+        // The engine's own counters go wherever the active path keeps them; the compute callback cannot know which.
+        int64_t* experts_out = &worker_stats.experts_streamed;
+        int64_t* filebytes_out = &worker_stats.file_read_bytes;
+        strata::prefill::Prefill stage_prefill;
+        stage_prefill.set_cpu_pool(&pool);
+        stage_prefill.set_stage(o.layer_begin, o.layer_end >= g.n_layers ? -1 : o.layer_end, nullptr);
+        // No borrowed buffers: the loan machinery exists to fit a prompt's temporary rows inside the expert cache,
+        // and borrowing is the part of the single-machine path most entangled with per-run planning. Until this
+        // path is measured, the conservative own-buffer form is the one worth trusting.
+        // COMPUTE IN BIG CHUNKS, SHIP IN SMALL FRAMES. These are two different limits and conflating them cost a
+        // 20K prompt about 100 seconds: chunking at 512 to fit the wire made Prefill pay its per-chunk overhead
+        // (expert table, synchronisation) forty times over. Prefill wants chunks large enough for that overhead to
+        // disappear; the wire wants frames small enough for the peer to buffer. So a 2048-row chunk is cut into
+        // 512-row frames on the way out.
+        const int64_t stage_chunk = 2048;
+        const int64_t stage_frame_rows = 512;
+        if (!stage_prefill.init(wt, g, ss, srcp, &xcache, host_res.empty() ? nullptr : host_res.data(),
+                               stage_chunk, main_cs, err, nullptr, 0, false)) {
+            std::fprintf(stderr, "stage: prefill init: %s\n", err.c_str()); return 1;
+        }
+        const int64_t stage_hc_n = (int64_t) g.hc * g.n_embd;
+        auto prefill_stage = [&](const int32_t* tokens, int64_t n, int64_t pos0, const float* hand_rows,
+                                 int64_t hand_elems, const strata::program::StageWorkerEmit& emit,
+                                 std::string& pe) -> bool {
+            std::vector<int64_t> toks(tokens, tokens + n);
+            if (hand_rows != nullptr) {
+                if (hand_elems != stage_hc_n) { pe = "stage: the prompt rows are not this stage's shape"; return false; }
+                stage_prefill.set_hand_in(hand_rows);       // this stage starts from its predecessor's rows
+            } else if (o.layer_begin > 0) {
+                pe = "stage: a non-entry stage needs the prompt's rows"; return false;
+            }
+            // ONE FRAME PER CHUNK, CUT SMALLER IF NEEDED. Prefill wants chunks big enough that its per-chunk cost
+            // disappears; the wire wants frames small enough for the peer to buffer. Those are different limits.
+            stage_prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                if (o.layer_end >= g.n_layers) return true;    // the last stage hands rows to nobody
+                for (int64_t at = 0; at < T; at += stage_frame_rows) {
+                    const int64_t rows = std::min(stage_frame_rows, T - at);
+                    strata::core::BoundaryFrame frame;
+                    if (!strata::core::boundary_frame_alloc(frame, rows, {"R", "bo", "inj"},
+                                                            {stage_hc_n, g.n_embd, g.hc})) {
+                        e = "stage: bad shape"; return false;
+                    }
+                    frame.pos0 = p0 + at;
+                    frame.next_token.resize((size_t) rows, -1);
+                    for (int64_t r = 0; r < rows; ++r) {
+                        const int64_t next_at = p0 + at + r + 1;
+                        frame.next_token[(size_t) r] =
+                            next_at < (int64_t) toks.size() ? (int32_t) toks[(size_t) next_at] : -1;
+                    }
+                    if (cudaMemcpy(frame.storage.data(), R_rows + (size_t) at * (size_t) stage_hc_n,
+                                   (size_t) rows * (size_t) stage_hc_n * sizeof(float),
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        e = "stage: the chunk copy failed"; return false;
+                    }
+                    if (!emit(frame)) return false;
+                }
+                return true;
+            };
+            const bool ok = stage_prefill.run(toks.data(), n, pos0, pe);
+            stage_prefill.on_chunk = nullptr;
+            const auto& ps = stage_prefill.stats();
+            *experts_out += ps.experts_streamed;
+            worker_stats.prefill_chunks += ps.chunks;
+            worker_stats.prefill_experts += ps.experts_streamed;
+            worker_stats.prefill_resident += ps.experts_resident;
+            worker_stats.prefill_host_ms += ps.ms_experts_host;
+            return ok;
+        };
+        std::string stage_identity;
+        for (const auto& shard : o.native_shards)
+            stage_identity += std::filesystem::path(shard).filename().string() + ";";
+        kvg_start(xcache.slots());
+        // Filled by both sides of the callback: the transport times and bytes are the ring's, the expert and file
+        // counters belong to this stage's engine, which knows its own residency answer.
+        // Between two requests this stage must forget the last document. session_zero covers R, the GDN recurrence,
+        // the QSA cache and the PLE history; the elastic K/V hands its cells back the same way a fresh run starts.
+        // A stage that skipped this would convolve request 2's first rows with request 1's, and the output would
+        // still look like text.
+        auto reset_stage = [&](std::string& re) -> bool {
+            strata::core::session_zero(ss, g, nullptr, main_cs);
+            if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
+                re = "stage: session reset did not synchronize"; return false;
+            }
+            kvg_start(xcache.slots());
+            return true;
+        };
+        auto compute_stage = [&](const strata::core::BoundaryFrame* input, int32_t token, int64_t pos,
+                                strata::core::BoundaryFrame& output, std::string& re) -> bool {
+            if (token < 0 || token >= g.n_vocab) { re = "stage: invalid input token"; return false; }
+            if (!kvg_ensure(pos + 64, [] { cudaDeviceSynchronize(); })) { re = "stage: KV capacity failed"; return false; }
+            const uint64_t stage_fb0 = src.file_read_bytes();
+            if (o.layer_begin > 0) {
+                if (!input) { re = "stage: nonzero stage requires boundary input"; return false; }
+                const auto* r = input->find("R"); const auto* b = input->find("bo"); const auto* inj = input->find("inj");
+                if (!r || !b || !inj || r->rows != 1 || b->rows != 1 || inj->rows != 1 ||
+                    r->elems_per_row != g.hc * g.n_embd || b->elems_per_row != g.n_embd || inj->elems_per_row != g.hc) {
+                    re = "stage: invalid boundary tensor shape"; return false;
+                }
+                std::memcpy(stage_hand, r->host, (size_t)r->floats() * sizeof(float));
+                std::memcpy(stage_hand + g.hc * g.n_embd, b->host, (size_t)b->floats() * sizeof(float));
+                std::memcpy(stage_hand + (g.hc + 1) * g.n_embd, inj->host, (size_t)inj->floats() * sizeof(float));
+            }
+            drive.d.failed = false; drive.d.layers = 0; drive.d.experts = 0;
+            int32_t sampled = -1;
+            if (!stage_ver.run(1, &token, pos, &drive_pool_multi, &drive, &sampled, re) || drive.d.failed) {
+                if (re.empty()) re = "stage: expert worker failed"; return false;
+            }
+            if (o.layer_end < g.n_layers) {
+                if (!stage_ver.boundary_capture(output, 1, pos, main_cs, re)) return false;
+                // The next stage needs the token THIS position consumed. A stage with the lm head sends the
+                // sampled token instead. Either way the frame carries exactly one token.
+                if (output.next_token.size() < 1) output.next_token.assign(1, token);
+                else output.next_token[0] = token;
+            } else {
+                if (output.next_token.size() < 1) output.next_token.assign(1, sampled);
+                else output.next_token[0] = sampled;
+            }
+            *experts_out += drive.d.experts;
+            *filebytes_out += (int64_t) (src.file_read_bytes() - stage_fb0);
+            return stage_ver.commit(1, re);
+        };
+        bool ok = false;
+        // The mesh form: this engine links to the daemon's two endpoints, listens on nothing, and knows no
+        // topology. It is the only stage form left: the ring's --listen/--downstream/--orch path was removed
+        // when --agent replaced it, and --agent itself was later split into --tectonic (mode) plus
+        // --worker-data-endpoint/--worker-signal-endpoint (parameters) - see the --tectonic field comment.
+        experts_out = &worker_stats.experts_streamed;
+        filebytes_out = &worker_stats.file_read_bytes;
+        strata::program::StageWorkerConfig wc;
+        wc.worker_data_endpoint = o.worker_data_endpoint;
+        wc.worker_signal_endpoint = o.worker_signal_endpoint;
+        wc.instance_id = o.instance_id;
+        wc.batch = o.batch > 0 ? o.batch : 1;
+        wc.lo = o.layer_begin; wc.hi = o.layer_end;
+        ok = strata::program::stage_worker_run(wc, compute_stage, reset_stage, prefill_stage,
+                                               &worker_stats, err);
+        if (!ok) std::fprintf(stderr, "stage: %s\n", err.c_str());
+        return ok ? 0 : 1;
+    }
+    // Tectonic: a non-entry single-process stage (layer_begin > 0, outside --tectonic and --split-devices)
+    // used to get its boundary input from --stage-input replaying another stage's dumped file. That flag is
+    // gone (no other producer ever existed for this combination), so without this check the path below would
+    // silently run with a zeroed hand-off buffer instead of refusing - computing a wrong answer instead of
+    // reporting that nothing can feed this process input.
+    if (!multi_gpu && o.layer_begin > 0) {
+        std::fprintf(stderr, "strata generate: a non-entry stage range (layer_begin > 0) needs --tectonic; "
+                             "there is no file-replay input source for it anymore\n");
+        return 2;
+    }
+
     // ---- plan v0.3 P5: the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
+    // THE PLAN'S IDENTITY, carried in every boundary frame: two stages that run another checkpoint, another
+    // quantization or another geometry must refuse each other's bytes instead of computing on them.
+    // THE IDENTITY IS THE MODEL, NOT THE PACK DIRECTORY: two stages of one split read different pack folders by
+    // construction (each indexes its own layers), so the folder name cannot be part of the check - the native
+    // shards can, and they are the same names on both sides of the split.
+    std::string boundary_identity;
+    for (const auto& shard : o.native_shards)
+        boundary_identity += std::filesystem::path(shard).filename().string() + ";";
+    const uint64_t boundary_fp = strata::core::boundary_model_fingerprint(
+        g.n_layers, g.n_embd, g.hc, g.n_expert, g.n_expert_used, boundary_identity.c_str());
     int64_t spec_pos = strata::spec::kSpecNotStarted;   // plan v0.3 P6: where the speculative loop starts (0 is a real position: a 1-token prompt on a native pack)
     strata::prefill::Prefill prefill;
     if (!multi_gpu && o.batch <= 0)   // STRATA_SWITCH_POINT: before any bytes_needed, like the share
@@ -21673,6 +21948,17 @@ int main(int argc, char** argv) {
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
         if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+        // A STAGE ALONE IN ITS PROCESS: the prompt path must not walk layers the session did not carve
+        // (`session_init` gave it only [layer_begin, layer_end)'s QSA states and GDN rows; a walk to n_layers
+        // read uninitialized ones and the batch indexer threw).  `-1` for the end = "to the last layer".
+        if (!multi_gpu && o.layer_end >= 0)
+            prefill.set_stage(o.layer_begin, o.layer_end >= g.n_layers ? -1 : o.layer_end, nullptr);
+        if (o.layer_end >= 0)
+            std::fprintf(stderr, "strata generate: prompt stage range [%lld, %lld)\n", (long long) o.layer_begin,
+                         (long long) o.layer_end);
+        // A non-entry single-process stage (layer_begin > 0, outside --tectonic) has no prompt-row source here
+        // since --stage-input (Tectonic: removed) was the only producer; see the --tectonic path for the
+        // network-driven equivalent, which gets its rows over the wire instead of from a file.
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {
@@ -21698,12 +21984,70 @@ int main(int argc, char** argv) {
                 return 1;
             }
             prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                // --dump-final-r ON THE PROMPT PATH: this is the one place a chunk's T final residual rows are
+                // handed over (`on_chunk` runs on the last stage, which a split stage is when it is alone in its
+                // process).  A split stage writes them for the next stage; the same `{pos, tok}` + hc*n_embd
+                // floats layout as the token path, one record per row.
+                if (final_r != nullptr) {
+                    std::vector<float> rows((size_t) T * (size_t) (g.hc * g.n_embd));
+                    if (cudaMemcpy(rows.data(), R_rows, rows.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        e = "dump-final-r: the chunk copy failed";
+                        return false;
+                    }
+                    // THE SAME ROW FORMAT THE TOKEN PATH WRITES: `[R][bo][inj]`, `handoff_floats` per row.  The prompt
+                    // path has no `bo`/`inj` of its own (they are a verify-window quantity), so those are zero - a
+                    // later stage's prompt path reads only the R part (`Prefill::set_hand_in`), and its verify path
+                    // gets its own rows from the decode records.
+                    const size_t per_row = (size_t) strata::core::Verifier::handoff_floats(g);
+                    std::vector<float> row_out(per_row, 0.0f);
+                    for (int64_t r = 0; r < T; ++r) {
+                        const int64_t tok_at = p0 + r + 1 < n_prompt ? (int64_t) o.tokens[(size_t) (p0 + r + 1)] : -1;
+                        const int64_t posrec[2] = {p0 + r, tok_at};
+                        std::memcpy(row_out.data(), rows.data() + (size_t) r * (size_t) (g.hc * g.n_embd),
+                                    (size_t) (g.hc * g.n_embd) * sizeof(float));
+                        std::fwrite(posrec, sizeof posrec, 1, final_r);
+                        std::fwrite(row_out.data(), sizeof(float), per_row, final_r);
+                    }
+                    std::fflush(final_r);
+                }
                 if (mtp.cell_floor_enabled() && prefill.kva_floor() > mtp.cell_floor()) mtp.set_cell_floor(prefill.kva_floor());   // KVA
                 // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
                 std::vector<int32_t> nxt((size_t) T);
                 for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t + 1)];
                 if (prefill.draft_kv(mtp, R_rows, nxt.data(), T, p0, e)) return true;   // E-9
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
+            };
+        }
+        // A SPLIT STAGE EXPORTS ITS PROMPT ROWS: the drafter's callback above is only installed with --mtp, so
+        // without it nothing wrote the chunk rows and a later stage had no position 0 to start from.
+        if (final_r != nullptr && o.layer_end >= 0 && o.layer_end < g.n_layers) {
+            prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                // ONE FRAME PER CHUNK, the same object the decode path writes: `R` from this chunk, and `bo`/`inj`
+                // zeroed (they are a verify-window quantity; a later stage's prompt path reads only `R`).
+                strata::core::BoundaryFrame frame;
+                if (!strata::core::boundary_frame_alloc(frame, T, {"R", "bo", "inj"},
+                                                        {g.hc * g.n_embd, g.n_embd, g.hc})) {
+                    e = "dump-final-r: bad chunk shape";
+                    return false;
+                }
+                frame.pos0 = p0;
+                frame.layer_begin = o.layer_begin;
+                frame.layer_end = o.layer_end;
+                frame.model_fingerprint = boundary_fp;
+                if (cudaMemcpy(frame.storage.data(), R_rows, (size_t) T * (size_t) (g.hc * g.n_embd) * sizeof(float),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    e = "dump-final-r: the chunk copy failed";
+                    return false;
+                }
+                for (int64_t r = 0; r < T; ++r)
+                    frame.next_token[r] = p0 + r + 1 < n_prompt ? (int32_t) o.tokens[(size_t) (p0 + r + 1)] : -1;
+                std::vector<uint8_t> bytes;
+                if (!strata::core::boundary_serialize(frame, bytes, e)) return false;
+                if (final_r != nullptr) {
+                    std::fwrite(bytes.data(), 1, bytes.size(), final_r);
+                    std::fflush(final_r);
+                }
+                return true;
             };
         }
 #if defined(STRATA_HAVE_DFLASH2)
@@ -21719,6 +22063,7 @@ int main(int argc, char** argv) {
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
+        const uint64_t pf_fb0 = src.file_read_bytes();     // how much of the prompt path actually came off disk
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -21753,6 +22098,9 @@ int main(int argc, char** argv) {
         prefill.clear_taps();
 #endif
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
+        std::fprintf(stderr, "strata generate: prompt path read %.2f GB from disk, moved %.2f GB to the device\n",
+                     (double) (src.file_read_bytes() - pf_fb0) / 1e9,
+                     (double) prefill.stats().experts_streamed * (double) strata::kernels::cpu::expert_layout().max_blob / 1e9);
         prefill_ms += prefill_batched_ms;
         mem_mark("the prompt was read");
         pos_start = n_batched;
@@ -21861,6 +22209,7 @@ int main(int argc, char** argv) {
             const int64_t posrec[2] = {pos, tok};
             std::fwrite(posrec, sizeof posrec, 1, final_r);
             std::fwrite(final_r_host.data(), sizeof(float), final_r_host.size(), final_r);
+            std::fflush(final_r);   // a reader (the next stage) must see the row as soon as it is written
         }
         if (drive.d.failed) {
             std::fprintf(stderr, "strata generate: the expert pool failed at layer %lld expert %lld: %s\n",
@@ -22043,6 +22392,38 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2) ver.set_taps(df2.tap_layers());
 #endif
+        // A STAGE ALONE IN ITS PROCESS: the verifier walks `[lb, le)` too, or it reads the QSA states the session
+        // did not carve (it threw at the first layer past the range).  The hand-off buffer is one row of
+        // `handoff_floats` per window row - `[R][bo][inj]` contiguous, the same layout the multi-GPU split uses -
+        // and it is both this stage's input (a later stage) and its output (an earlier one), so a socket only has
+        // to carry that buffer.
+        const int64_t HB = strata::core::Verifier::handoff_floats(g);
+        const bool stage_split = !multi_gpu && o.layer_end >= 0;
+        // PINNED, because the verifier's hand-off copies are asynchronous (a pageable destination makes
+        // cudaMemcpyAsync a synchronising bounce copy, and on this driver it failed outright).
+        float* hand_host = nullptr;
+        const size_t hand_floats = (size_t) strata::kernels::kVerifyMaxT * (size_t) HB;
+        std::vector<float> hand_io;
+        if (stage_split) {
+            if (cudaHostAlloc((void**) &hand_host, hand_floats * sizeof(float), cudaHostAllocPortable) != cudaSuccess ||
+                hand_host == nullptr) {
+                std::fprintf(stderr, "strata generate: the stage hand-off buffer (%zu floats) failed\n", hand_floats);
+                return 1;
+            }
+            hand_io.assign(hand_floats, 0.0f);   // shadowed by hand_host from here on: see the uses below
+            // A non-entry single-process stage (layer_begin > 0, outside --tectonic) used to fill hand_host from
+            // the frames --stage-input (Tectonic: removed) read from a file; there is no other producer for this
+            // combination, so hand_host stays zeroed here. The network-driven --tectonic path gets its handoff
+            // rows over the wire instead and never reaches this function.
+            // The verifier's input is null on purpose: a stage that ran its own prompt path has its K/V and
+            // recurrence already in place, so a decode window starts from a token's embedding.  Handing it the
+            // frame's rows here made it treat layer 24's input as if it were a new token's residual.
+            // A RING, NOT A PIPELINE: the tail's downstream is the head (the user endpoint lives there), so the
+            // tail's verifier reads the head's rows every window and sends back the token it sampled.
+            ver.set_stage(o.layer_begin, o.layer_end >= g.n_layers ? -1 : o.layer_end,
+                          o.layer_begin > 0 ? hand_host : nullptr,
+                          o.layer_end < g.n_layers ? hand_host : nullptr);
+        }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -22660,6 +23041,43 @@ int main(int argc, char** argv) {
                 }
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
+            }
+            // --dump-final-r ON THE SPECULATIVE PATH: the token loop breaks out at the last prompt position
+            // (`if (o.spec > 0 && pos >= n_prompt - 1) ... break`), so decode never reaches that write site.  A
+            // split stage still hands its residual on every step, so it is written here - one record per window
+            // row, same `{pos, tok}` + `hc * n_embd` floats layout as the token path.
+            if (final_r != nullptr && stage_split && o.layer_end < g.n_layers) {
+                // AN EARLIER STAGE OF A CROSS-MACHINE SPLIT hands its boundary on as one frame (boundary_wire.hpp):
+                // the tensors are named and the position, the stage range and the predicted tokens travel with them,
+                // so the next stage cannot read a prompt row for a decode row or the wrong stride.
+                strata::core::BoundaryFrame frame;
+                std::string berr;
+                if (!ver.boundary_capture(frame, T, p, main_cs, berr)) {
+                    std::fprintf(stderr, "strata generate: %s\n", berr.c_str());
+                    return 1;
+                }
+                frame.model_fingerprint = boundary_fp;
+                for (int64_t r = 0; r < T; ++r) frame.next_token[r] = (int32_t) outv[(size_t) r];
+                std::vector<uint8_t> bytes;
+                if (!strata::core::boundary_serialize(frame, bytes, berr)) {
+                    std::fprintf(stderr, "strata generate: %s\n", berr.c_str());
+                    return 1;
+                }
+                if (final_r != nullptr) {
+                    std::fwrite(bytes.data(), 1, bytes.size(), final_r);
+                    std::fflush(final_r);
+                }
+            } else if (final_r != nullptr) {
+                const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
+                if (final_r_host.size() < n_floats) final_r_host.resize(n_floats);
+                cudaMemcpy(final_r_host.data(), ver.final_R_all(), n_floats * sizeof(float), cudaMemcpyDeviceToHost);
+                for (int64_t r = 0; r < T; ++r) {
+                    const int64_t posrec[2] = {p + r, (int64_t) outv[(size_t) r]};
+                    std::fwrite(posrec, sizeof posrec, 1, final_r);
+                    std::fwrite(final_r_host.data() + (size_t) r * (size_t) (g.hc * g.n_embd), sizeof(float),
+                                (size_t) (g.hc * g.n_embd), final_r);
+                }
+                std::fflush(final_r);
             }
             if (drive.d.failed) {
                 std::fprintf(stderr, "strata generate: the expert pool failed at layer %lld expert %lld: %s\n",

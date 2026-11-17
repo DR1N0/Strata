@@ -498,7 +498,8 @@ void native_gu_rows_invariant(const NativeFmt&, const uint8_t*, const void* cons
 void native_down_rows_invariant(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif
 
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err,
+                        int64_t layer_begin, int64_t layer_end) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -593,15 +594,46 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         L.bytes[(size_t) l] = blob;
         if (blob > L.max_blob) L.max_blob = blob;
     }
-    uint64_t at = 0;
-    for (int64_t l = 0; l < n_layers; ++l) {
-        if (L.offset[(size_t) l] != at) {
-            err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
-            return false;
+    // A STAGE PACK HOLDS ONLY ITS OWN LAYERS. The blob file must then be the concatenation of exactly the layers
+    // in [layer_begin, layer_end), so the contiguity check applies to that range and to nothing else; every layer
+    // outside it is marked empty rather than left pointing into a file that no longer contains it. A whole-model
+    // pack (the default range) is unchanged.
+    if (layer_end < 0 || layer_end > n_layers) layer_end = n_layers;
+    if (layer_begin < 0) layer_begin = 0;
+    // TWO KINDS OF PACK SHARE THIS FORMAT. A whole-model pack keeps every layer at its global offset; a stage pack
+    // contains only the blobs of [layer_begin, layer_end), so its first owned layer starts at zero and the layer
+    // just past the range reads as zero (it is not in the file). The two are told apart by that boundary offset,
+    // which is the only place they differ - and the distinction matters, because `total` is checked against the
+    // file's size and would be wrong by the size of the layers a stage does not own.
+    const bool stage_pack = layer_begin > 0 ? L.offset[(size_t) layer_begin] == 0
+                                            : (layer_end < n_layers && L.offset[(size_t) layer_end] == 0);
+    if (stage_pack) {
+        // Only the owned layers are in the file, and they are consecutive from zero.
+        uint64_t at = 0;
+        for (int64_t l = 0; l < n_layers; ++l) {
+            if (l < layer_begin || l >= layer_end) { L.offset[(size_t) l] = 0; L.bytes[(size_t) l] = 0; continue; }
+            if (L.offset[(size_t) l] != at) {
+                err = "native_experts.txt: layer " + std::to_string(l) +
+                      " is missing or not contiguous within the pack's layer range [" + std::to_string(layer_begin) +
+                      "," + std::to_string(layer_end) + ")";
+                return false;
+            }
+            at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
         }
-        at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
+        L.total = at;
+    } else {
+        // A whole-model pack: every layer is present at its global offset, and this process reads its own subset of
+        // it. Unchanged from before - the file really does hold all of them.
+        uint64_t at = 0;
+        for (int64_t l = 0; l < n_layers; ++l) {
+            if (L.offset[(size_t) l] != at) {
+                err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
+                return false;
+            }
+            at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
+        }
+        L.total = at;
     }
-    L.total = at;
     // v5: Agention's Hadamard-folded experts (prism.hadamard, hadamard.hpp).  The pack must say which layers are
     // rotated and with what signs; a v5 pack without hadamard.txt (or the reverse) is refused, never run unrotated.
     {

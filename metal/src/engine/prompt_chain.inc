@@ -240,13 +240,29 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         b.emb_ms += cur.ms_emb; b.ple_ms += cur.ms - cur.ms_emb;
     }
     mrope_sync(pos0, nT);
-    for (int t = 0; t < nT; ++t) {
-        float* r = b.R.as<float>() + (size_t) t * HC * N;
-        if (const float* img = img_row(pos0 + t)) std::memcpy(r, img, (size_t) N * 4);
-        else std::memcpy(r, cur.emb.data() + (size_t) t * N, (size_t) N * 4);
-        for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
+    // A STAGE THAT DOES NOT OWN LAYER 0 STARTS FROM ITS PREDECESSOR'S ROWS. Embedding a token it already consumed
+    // would compute a different sequence than the one the earlier stages advanced; the residual rows are the state
+    // that crosses the boundary, one row per token, exactly the layout stage_export writes.
+    const bool staged = stage_.layers > 0;
+    const int LB = staged ? stage_.begin : 0;
+    const int LE = staged ? stage_.end : G_NL;
+    if (LB == 0) {
+        for (int t = 0; t < nT; ++t) {
+            float* r = b.R.as<float>() + (size_t) t * HC * N;
+            if (const float* img = img_row(pos0 + t)) std::memcpy(r, img, (size_t) N * 4);
+            else std::memcpy(r, cur.emb.data() + (size_t) t * N, (size_t) N * 4);
+            for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
+        }
+    } else if (prompt_hand_ != nullptr) {
+        // The chunk's own slice of the prompt's rows; see prompt_chunk. Base + pos0 rows.
+        std::memcpy(b.R.as<float>(), prompt_hand_ + (size_t) pos0 * (size_t) HC * N,
+                    (size_t) nT * HC * N * sizeof(float));
+    } else {
+        err = "metal prompt: a non-entry stage has no handoff rows"; return false;
     }
-    if (ple_on_) std::memcpy(b.pemb.as<float>(), cur.ple.data(), (size_t) nT * N * 4);
+    // PLE belongs to the stage that owns layer 1; every other stage has no PLE rows to compute.
+    const bool ple_here = ple_on_ && LB <= 1 && 1 < LE;
+    if (ple_here) std::memcpy(b.pemb.as<float>(), cur.ple.data(), (size_t) nT * N * 4);
     b.host_ms += now_ms() - th0;
     std::vector<mtl::Dispatch> ds;
     ds.reserve(2400);
@@ -306,7 +322,9 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     };
     const int hp = hp_;
     int gi = 0, qi = 0;
-    for (int l = 0; l < G_NL; ++l) {
+    // THIS STAGE'S LAYERS ONLY. Walking to G_NL was what made a Metal prompt an all-48-layer computation; a split's
+    // stage must stop at its own end, because the rows it hands over are the ones the next stage continues from.
+    for (int l = LB; l < LE; ++l) {
         const std::string bl = "blk." + std::to_string(l) + ".";
         hc_read(bl + "hc_attn", l > 0 && !(l == 1 && ple_on_));
         if (l % G_QI != G_QI - 1) {
@@ -581,7 +599,12 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
         if (on_chunk) {
             const double tm0 = now_ms();
             mpsrc_ = &pb_.R;   // the drafter's prompt rows are this chunk's final residuals
-            const bool ok = on_chunk(nullptr, nT, pos0 + c, err);
+            // HAND THE ROWS OUT. A stage that ends before the last layer must send this chunk's residuals to the
+            // next stage, and they are exactly what `pb_.R` holds: the final residual of every row in the chunk.
+            // Passing null here made a split stage unable to run a prompt at all, which is why this path was
+            // previously only usable whole. The pointer is the device one, as on the CUDA path, so a caller's
+            // cudaMemcpy means the same thing on both backends.
+            const bool ok = on_chunk(pb_.R.as<float>(), nT, pos0 + c, err);
             mpsrc_ = nullptr;
             if (mtp_async_) std::swap(pb_.R, pb_.R2);   // the drafter's rows are still reading this chunk's residuals: the next chunk writes the other
             pb_.mtp_ms += now_ms() - tm0;
