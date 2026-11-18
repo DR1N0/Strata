@@ -41,6 +41,7 @@ BoundaryFrame make_rows_frame(int64_t rows, int64_t hc, int64_t n) {
     BoundaryFrame f;
     f.kind = kBoundaryRows;
     f.model_fingerprint = 0x1234567890abcdefull;
+    f.request_id = 0xfeedfacecafebeefull;
     f.pos0 = 7;
     f.layer_begin = 0;
     f.layer_end = 24;
@@ -68,6 +69,7 @@ void round_trip(const BoundaryFrame& in, const char* what) {
     check(out.version == in.version, std::string(what) + ": version");
     check(out.kind == in.kind, std::string(what) + ": kind");
     check(out.model_fingerprint == in.model_fingerprint, std::string(what) + ": fingerprint");
+    check(out.request_id == in.request_id, std::string(what) + ": request_id");
     check(out.pos0 == in.pos0, std::string(what) + ": pos0");
     check(out.rows == in.rows, std::string(what) + ": rows");
     check(out.layer_begin == in.layer_begin && out.layer_end == in.layer_end, std::string(what) + ": stage range");

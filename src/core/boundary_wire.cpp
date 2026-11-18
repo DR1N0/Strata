@@ -2,18 +2,22 @@
 //
 // boundary_wire.cpp - the frame's serialization.  See boundary_wire.hpp for why it exists.
 //
-// The wire layout (little-endian, packed, no padding), version 3 (kBoundaryVersion):
+// The wire layout (little-endian, packed, no padding), version 4 (kBoundaryVersion):
 //
-//   u32 magic | u16 version | u16 kind | u16 n_tensors | u64 model_fingerprint
+//   u32 magic | u16 version | u16 kind | u16 n_tensors | u64 model_fingerprint | u64 request_id
 //   i64 pos0  | i64 rows    | i64 layer_begin | i64 layer_end
 //   n_tensors x { u16 name_len | name bytes | i64 rows | i64 elems_per_row }
 //   rows x i32 next_token
 //   payload: for each tensor in order, rows * elems_per_row f32
 //
+// `request_id` is new in version 4 (Tectonic wire v4): every other field here was already in version 3.
+// It sits beside `model_fingerprint` because both are identity fields read before anything else about the
+// frame's shape - the tensor table and token count below still don't depend on it.
+//
 // THE TOKEN COUNT IS `rows`: one token per row, always.  A decode window has <= 16 rows, a prompt chunk has
 // hundreds, a Request's rows ARE the prompt.  The count is implicit so that a reader with no tensor table (an
 // orchestrator that only sends prompts and prints tokens) can parse the header with one fixed struct
-// (`<IHHHQqqqq`, 50 bytes) and then read `rows` int32s.
+// (`<IHHHQQqqqq`, 58 bytes) and then read `rows` int32s.
 //
 // Everything a reader needs to reject a frame it cannot interpret is in front of the payload, and
 // every length is checked against the bytes actually present before it is used.
@@ -128,6 +132,7 @@ BoundaryFrame& BoundaryFrame::operator=(const BoundaryFrame& o) {
     version = o.version;
     kind = o.kind;
     model_fingerprint = o.model_fingerprint;
+    request_id = o.request_id;
     pos0 = o.pos0;
     rows = o.rows;
     layer_begin = o.layer_begin;
@@ -149,6 +154,7 @@ BoundaryFrame& BoundaryFrame::operator=(BoundaryFrame&& o) noexcept {
     version = o.version;
     kind = o.kind;
     model_fingerprint = o.model_fingerprint;
+    request_id = o.request_id;
     pos0 = o.pos0;
     rows = o.rows;
     layer_begin = o.layer_begin;
@@ -206,7 +212,7 @@ int64_t boundary_wire_token_count(const BoundaryFrame& f) {
 }
 
 size_t boundary_serialize_size(const BoundaryFrame& f) {
-    size_t n = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 8 + 8;   // magic, version, kind, n_tensors, five i64/u64
+    size_t n = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 8 + 8 + 8;   // magic, version, kind, n_tensors, six i64/u64
     for (int i = 0; i < f.n_tensors; ++i) n += 2 + std::strlen(f.tensors[i].name) + 8 + 8;
     n += (size_t) boundary_wire_token_count(f) * 4;
     for (int i = 0; i < f.n_tensors; ++i) n += (size_t) f.tensors[i].floats() * 4;
@@ -244,6 +250,7 @@ bool boundary_serialize(const BoundaryFrame& f, std::vector<uint8_t>& out, std::
     put_u16(out, f.kind);
     put_u16(out, (uint16_t) f.n_tensors);
     put_u64(out, f.model_fingerprint);
+    put_u64(out, f.request_id);
     put_u64(out, (uint64_t) f.pos0);
     put_u64(out, (uint64_t) f.rows);
     put_u64(out, (uint64_t) f.layer_begin);
@@ -277,6 +284,7 @@ bool boundary_deserialize(const uint8_t* bytes, size_t n, BoundaryFrame& f, std:
     f.kind = r.u16();
     const uint16_t nt = r.u16();
     f.model_fingerprint = r.u64();
+    f.request_id = r.u64();
     f.pos0 = r.i64();
     f.rows = r.i64();
     f.layer_begin = r.i64();

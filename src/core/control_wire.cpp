@@ -17,12 +17,11 @@ bool send_json(BoundarySocket& sock, const json& j, std::string& err) {
     return sock.send_frame(bytes, err);
 }
 
-// Returns false with `err` set on a transport error or malformed JSON. A well-formed non-object (an
-// array, a bare number) is reported the same way: the contract's messages are always objects, so
-// anything else is as malformed as a parse failure.
-bool recv_json(BoundarySocket& sock, json& out, std::string& err) {
-    std::vector<uint8_t> bytes;
-    if (!sock.recv_frame(bytes, err, kControlMaxFrameBytes)) return false;
+// Returns false with `err` set on malformed JSON. A well-formed non-object (an array, a bare number) is
+// reported the same way: the contract's messages are always objects, so anything else is as malformed as
+// a parse failure. Split out from recv_json so a caller that already has the frame's bytes (entry_bridge's
+// peek-then-dispatch - see control_parse_gen) does not have to read a second frame to get them.
+bool parse_json_bytes(const std::vector<uint8_t>& bytes, json& out, std::string& err) {
     try {
         out = json::parse(bytes.begin(), bytes.end());
     } catch (const json::parse_error& e) {
@@ -34,6 +33,12 @@ bool recv_json(BoundarySocket& sock, json& out, std::string& err) {
         return false;
     }
     return true;
+}
+
+bool recv_json(BoundarySocket& sock, json& out, std::string& err) {
+    std::vector<uint8_t> bytes;
+    if (!sock.recv_frame(bytes, err, kControlMaxFrameBytes)) return false;
+    return parse_json_bytes(bytes, out, err);
 }
 
 const char* reject_reason_code(HelloRejectReason r) {
@@ -154,6 +159,71 @@ bool control_recv_signal(BoundarySocket& sock, SignalMessage& out, std::string& 
     err = "control: unexpected signal-connection message " +
           (type.empty() ? std::string("(no type)") : type);
     return false;
+}
+
+bool control_send_gen(BoundarySocket& sock, const GenFields& f, std::string& err) {
+    json j;
+    j["type"] = "gen";
+    j["request_id"] = f.request_id;
+    j["tokens"] = f.tokens;
+    j["max_new"] = f.max_new;
+    return send_json(sock, j, err);
+}
+
+namespace {
+bool gen_from_json(const json& j, GenFields& out, std::string& type_out, std::string& err) {
+    type_out = j.value("type", std::string());
+    if (type_out != "gen") {
+        err = "control: expected gen, got " + (type_out.empty() ? std::string("a message with no type") : type_out);
+        return false;
+    }
+    out.request_id = j.value("request_id", std::string());
+    out.tokens.clear();
+    if (j.contains("tokens") && j["tokens"].is_array()) {
+        for (const auto& t : j["tokens"]) out.tokens.push_back(t.get<int32_t>());
+    }
+    out.max_new = j.value("max_new", 0);
+    return true;
+}
+}  // namespace
+
+bool control_recv_gen(BoundarySocket& sock, GenFields& out, std::string& type_out, std::string& err) {
+    json j;
+    if (!recv_json(sock, j, err)) return false;
+    return gen_from_json(j, out, type_out, err);
+}
+
+bool control_parse_gen(const std::vector<uint8_t>& bytes, GenFields& out, std::string& type_out, std::string& err) {
+    json j;
+    if (!parse_json_bytes(bytes, j, err)) return false;
+    return gen_from_json(j, out, type_out, err);
+}
+
+bool control_send_delta(BoundarySocket& sock, const std::string& request_id, int32_t token, std::string& err) {
+    json j;
+    j["type"] = "delta";
+    j["request_id"] = request_id;
+    j["token"] = token;
+    return send_json(sock, j, err);
+}
+
+bool control_send_done(BoundarySocket& sock, const std::string& request_id, const std::vector<int32_t>& tokens,
+                       std::string& err) {
+    json j;
+    j["type"] = "done";
+    j["request_id"] = request_id;
+    j["tokens"] = tokens;
+    return send_json(sock, j, err);
+}
+
+bool control_send_error(BoundarySocket& sock, const std::string& request_id, const std::string& code,
+                        const std::string& message, std::string& err) {
+    json j;
+    j["type"] = "error";
+    if (!request_id.empty()) j["request_id"] = request_id;
+    j["code"] = code;
+    j["message"] = message;
+    return send_json(sock, j, err);
 }
 
 }  // namespace strata::core

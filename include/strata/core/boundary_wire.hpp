@@ -36,11 +36,19 @@
 namespace strata::core {
 
 inline constexpr uint32_t kBoundaryMagic = 0x31544354u;   // "TCT1"
-/// 3: the header is a fixed 50 bytes (`<IHHHQqqqq`) and the token count IS `rows`.  A decode window's rows
+/// 4: the header is a fixed 58 bytes (`<IHHHQQqqqq`) and the token count IS `rows`.  A decode window's rows
 /// are <= 16, a prompt chunk's are hundreds, a Request's are the whole prompt - and in every one of them
 /// there is exactly one token per row.  Keeping the count implicit is what lets a reader with no tensor table
 /// (an orchestrator that only sends prompts and prints tokens) parse a frame with a fixed-offset struct.
-inline constexpr uint16_t kBoundaryVersion = 3;
+///
+/// 3 -> 4 (Tectonic, wire v4): added `request_id` (see BoundaryFrame::request_id below). Version 3 had no
+/// way to tell two requests' frames apart on the same connection - its own comment on BoundaryKind said so
+/// outright ("must tell them apart without a control plane", using only `kind`). That was fine when exactly
+/// one request's frames were ever in flight on a connection at a time; Tectonic's Tier 1 concurrency (ADR
+/// 0004, and the wire-v4 ADR this bump belongs to) needs more than one, so the wire needed an identity field
+/// before anything built on top of it could multiplex correctly. This is a breaking change on purpose - a v3
+/// reader must refuse a v4 frame outright, not misread 8 extra bytes as something else.
+inline constexpr uint16_t kBoundaryVersion = 4;
 
 /// Rows a decode window can hold: the default length of `next_token`.
 inline constexpr int kBoundaryMaxRows = 16;
@@ -93,6 +101,14 @@ struct BoundaryFrame {
     uint16_t version = kBoundaryVersion;
     uint16_t kind = kBoundaryPrompt;   ///< one of BoundaryKind: what this message is for
     uint64_t model_fingerprint = 0;   ///< checkpoint + quantization + geometry; a mismatch is refused, not corrected
+    /// Which request this frame belongs to. Opaque outside the stage that minted it (today, the entry
+    /// stage's gen/delta/done bridge - see entry_bridge.hpp): no stage may renumber or reinterpret it, only
+    /// pass it through unchanged, which is why it is NOT in the same category as layer_begin/layer_end below
+    /// (those two every stage overwrites with its own range; this one no stage may touch). A frame built by
+    /// hand (as every caller before wire v4 did) that never sets this is request_id 0, which is a valid value,
+    /// not a sentinel for "none" - see stage_worker.hpp's per-request map for how a single-request caller
+    /// degrades correctly without ever assigning one.
+    uint64_t request_id = 0;
     int64_t pos0 = 0;                 ///< the absolute position of row 0 (a Request: max_new)
     int64_t rows = 0;                 ///< T: a decode window, a prompt chunk, or a Request's prompt length
     int64_t layer_begin = 0;          ///< the producing stage's [begin, end)

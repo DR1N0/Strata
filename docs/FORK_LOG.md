@@ -89,13 +89,16 @@ fire-and-forget：不需要独立的"已收到取消"回执，结果体现在该
       正确；**没有在真实 daemon/假 daemon 之间跑通过**，见下面的"未验证"
 - [x] 信号连接本身：`stage_worker_run` 里新开一条到 `worker_signal_endpoint` 的连接，握手后在
       独立线程里循环读 `cancel`/`shutdown`
-- [x] 逐 token 取消检查点：数据循环每个位置处理前检查一次（`std::atomic<bool> cancel_requested`，
-      信号线程置位），不是每批一次。**已知缺口**：命中后用 `kBoundaryEnd` 回复——这是二进制 wire
-      仅有的"请求结束"帧，不区分"正常结束"和"被取消"；对下游来说两者长得一样。真正的区分
-      （契约里 `error` 带 `code: cancelled`）要靠 JSON 数据连接的 `error` 消息，而这个循环现在
-      还不发 JSON 数据消息，见下面的架构待决项
-- [ ] `stage_worker_run` 外层的并发调度层（攒批 + `run_slot_rows` + 按 `request_id` 分发）——
-      **因为下面这条架构待决项没有答案，这次没有动手实现**，强行写会是在猜
+- [x] 逐 token 取消检查点：数据循环每个位置处理前检查一次（2026-11-18 之前是
+      `std::atomic<bool> cancel_requested`，现在是按 request_id 查表，见下面 2026-11-18 小节）。
+      **缺口已部分补上**：entry stage 且被 entry bridge 认得的 request_id，取消现在回真正的
+      `error{code:"cancelled"}`（JSON，不再是看起来和正常结束一样的 `kBoundaryEnd`）；非 entry
+      stage 仍是老行为（`kBoundaryEnd`，和正常结束在 wire 上长得一样），因为它没有 bridge 可查
+- [x] `stage_worker_run` 外层的 Tier 1 并发（按 request_id 隔离的交替处理，不是 `run_slot_rows`
+      合批）——架构待决项已确认（见下面 2026-11-18 小节），wire v4 + per-request 状态表 + entry
+      bridge 已实现并验证。`run_slot_rows` 合批（Tier 2）仍未动手，理由变了：不再是"架构不确定"，
+      而是"收益依赖专家是否 GPU 常驻，这轮刻意不做"（Tectonic 侧 ADR 0005 的决定，不是这个仓库
+      自己能下的判断）
 - [x] 复核时补了一处遗漏：默认单次命令行模式下 `o.layer_begin > 0`（非 `--tectonic`、非
       `--split-devices`，现在只能通过 `--layers` 设置）过去唯一的输入来源是 `--stage-input`，
       删掉它之后这个组合会静默用全零的 hand-off buffer 跑出错误结果，而不是报错。现在在
@@ -108,7 +111,90 @@ fire-and-forget：不需要独立的"已收到取消"回执，结果体现在该
 - [ ] 散落在各处注释里提到 `--agent`/ring 的旧描述，**不逐条全仓库扫描修复**，只在这次改动直接
       经过的地方顺手清理过（见下面"维护规则"）
 
-## 架构待决：`gen`/`delta`/`done` 和 BoundaryFrame 是什么关系
+## 2026-11-18：wire v4（`request_id`）、per-request 状态表、entry bridge——架构待决项已回到 Tectonic 侧确认
+
+上一节的"架构待决"问题被拿回 Tectonic 设计讨论里确认了：**方案 1**（`gen`/`delta`/`done` 只是
+entry stage 自己的请求生命周期外壳，stage 间的残差交换继续走 `BoundaryFrame`，不变）。方案 2（daemon
+变成张量转发者）被排除——和"daemon 只透传不透明字节"这条已验证的设计矛盾，也完全没必要：真正驱动
+这次决定的是 `R` 的实际形状（`[96,10240]`，96 行 prefill 块 fp32 约 3.9MB），塞进 JSON 不划算，二进制
+格式本来就是对的选择。完整记录见 Tectonic 仓库的 `docs/decisions/0005-wire-v4-request-id.md`。
+
+**做了什么**：
+
+- `include/strata/core/boundary_wire.hpp` / `src/core/boundary_wire.cpp`：`BoundaryFrame` 加
+  `uint64_t request_id`（紧跟 `model_fingerprint` 之后），`kBoundaryVersion` 3→4（50→58 字节头，
+  `<IHHHQQqqqq`）。`request_id` 是不透明值，任何 stage 转发时原样带过去，不像 `layer_begin`/
+  `layer_end` 那样被每个 stage 改写成自己的范围。`tools/test_boundary_wire.cpp`（CPU-only 的既有
+  wire 测试）同步加了 request_id 的往返校验。Tectonic 仓库的 `tools/mesh_wire.py`（Python 镜像）
+  和 `tools/src/tectonic_tools/probes/stage_probe.py`（诊断探针）也同步改了——这两个文件不在本仓库，
+  但它们必须和这里的 wire 字节级一致，否则 v4 引擎直接拒绝它们发的 v3 帧。
+- `src/program/stage_worker.hpp`：`stage_worker_run` 原来的单一共享变量（`pf_n`/`pf_rows`/
+  `pf_tokens`/`cancel_requested`）换成 `std::unordered_map<uint64_t, PerRequestState>`，按帧的
+  `request_id` 查表。信号线程只写 `cancelled`（`std::atomic<bool>`），`requests_mu` 只保护 map
+  结构本身（insert/find/erase），不保护 prefill 累积缓冲区（只有主循环会碰它们）。**明确没做**：
+  `reset()`（session_zero：R/GDN 递归态/QSA cache/PLE 历史）语义没碰——Tier 1 阶段这个引擎进程依然
+  只有一份计算状态常驻，per-request map 解决的是"交替处理不串数据"，不是"真正并发计算"；
+  `StageWorkerConfig::batch`/`HelloFields::batch` 的注释已经更新，明确这是协议层在途数量，不是计算
+  状态独立的 slot 数。
+- `include/strata/core/control_wire.hpp` / `.cpp`：新增 `gen`/`delta`/`done`/`error` 的 JSON 读写
+  函数（`GenFields`、`control_send_gen`/`control_recv_gen`/`control_parse_gen`/`control_send_delta`/
+  `control_send_done`/`control_send_error`），字段形状和 Tectonic Go 侧 `internal/engine/protocol.go`
+  一一对应。文件头注释从"待决"改成"已解决"。
+- 新文件 `include/strata/core/entry_bridge.hpp` + `src/core/entry_bridge.cpp`：`EntryBridge` 类，
+  维护 Tectonic 字符串 `request_id` ↔ 本进程内 64 位 wire id 的映射、准入上限、每请求已生成 token 计数
+  （`max_new` 比较）。只在 entry stage（`layer_begin == 0`）且被显式接上时启用。
+- `stage_worker_run` 接入：数据连接现在可能收到两种字节——`BoundaryFrame`（原有，和邻居 stage 之间）
+  和 JSON `gen`（和本机 daemon 之间）——靠首 4 字节是否等于 `kBoundaryMagic` 区分
+  （`looks_like_boundary_frame`），同一套 u32 长度前缀框架天然支持两种 payload，不需要第二套分帧。
+  收到 `gen` 后：按"prefill 处理 [0, n-1)，最后一个 prompt token 走 decode 路径"（`generate.cpp`
+  自己的 plan v0.3 P5 注释）拆成 1-2 个合成帧塞进 `pending` 队列；每次 decode 产出的 token 翻译成
+  `delta`，达到 `max_new` 就 `done`+释放，没达到就把采样 token 自己喂回去当下一个位置的输入——这是
+  以前由 Python daemon 原型的回显循环做的事，现在 Go daemon 不说 `BoundaryFrame` 了，只能挪进引擎自己
+  做。取消：信号连接的 `cancel` 命中时，entry bridge 能查到是哪个 Tectonic 请求，直接回真正的
+  `error{code:"cancelled"}`，不再是"看起来和正常结束一样的 `kBoundaryEnd`"那个老缺口——但这只在
+  entry stage 且 bridge 认得这个 request_id 时成立，非 entry stage 仍是老行为（没有变，也不可能变，
+  见下面"明确没做"）。
+
+**明确没做，而且是测试过程中才发现、不是一开始就知道要排除的**：
+
+1. **真正的并发准入（`batch_full`）在这套接入方式下永远不会在 socket 层触发**。
+   自喂循环（采样 token 没到 `max_new` 就塞回 `pending`，下一轮循环优先处理 `pending` 而不是读
+   socket）意味着：只要一个请求还没走完，主循环根本不会再去读 socket，新的 `gen` 只是安静地躺在
+   TCP 接收缓冲区里，等当前请求**完全结束、释放 bridge 名额之后**才会被读到——这时候已经不存在
+   "超限"这件事了，新请求总是顺利准入。`EntryBridge::admit` 的容量检查代码本身是对的（有独立于
+   socket 的单元测试验证，见下面"验证"），但这条集成路径永远走不到它的拒绝分支。想要在繁忙连接上
+   真正触发 `batch_full`，主循环需要在还有 `pending` 积压时也去 poll 一下 socket，而不是把
+   `pending` 排空当成唯一优先级——这是下一步要做的事，不是这次能顺手带上的。
+2. **EOS 检测没有实现**：旧 Python daemon 回显循环靠外部把采样 token 和模型的 EOS id 比较来决定
+   "正常结束 vs 继续"，`stage_worker.hpp` 一直是模型无关的，不知道 EOS id 是什么。本轮 entry bridge
+   只按 `max_new` 计数停止，不检测 EOS——真实生成会越过模型自己该停的点，这是文本质量问题，不是
+   wire 机制问题，但不能不提。
+3. **真正切分（多机）下 entry bridge 不处理环闭合**：`out.n_tensors == 0 && c.lo == 0` 这个信号只对
+   "entry 自己独占整个模型"的单 stage 部署成立；一个真正跨机的 split，环绕一圈回到 entry 的采样
+   token 需要另一种判定方式（"这是我自己发出去的请求的环闭合"要和"邻居发来的其他流量"区分），
+   本轮没有实现，也没有在这个方向上做任何假设性尝试。
+
+以上三条都写在 `entry_bridge.hpp` 的文件头注释里，不是只记在这里。
+
+**验证**（这次要求真正跑起来，不是 `-fsyntax-only`）：`tools/test_tier1_concurrency.cpp`，CPU-only，
+两个真实 TCP 连接对（数据+信号），`stage_worker_run` 跑在独立线程里，和驱动它的"假 daemon"不共享
+调用栈：
+
+- Section A：一个非 entry-bridge 的 stage，两个 request_id（100、200）交替推进，验证 prefill/decode
+  状态不串、取消 100 不影响 200（修复了一处真 bug：`current_request_id` 原来只在 `pos0==0` 时更新，
+  导致请求 200 的后续位置会被误判成"当前"，取消请求 100 时实际打中了 200——测试第一次跑直接暴露了
+  这个问题，不是靠代码审查发现的）。
+- Section B：entry bridge 全链路，4-token prompt 验证 prefill 拿到的确实是前 n-1 个 token、
+  decode 从最后一个 prompt token 开始、`done.tokens` 等于完整序列、一个 gen 在另一个处理期间发送后
+  按顺序排队接纳（而不是当场拒绝，见上面的发现 1）、单 token prompt、取消翻译成
+  `error{code:cancelled}`。
+- Section C：`EntryBridge::admit` 的容量检查单独测（不经过 socket），因为 Section B 证明了集成路径
+  碰不到这个分支——这是本节的做法：承认"写了但集成测不到"，用独立测试补上去，而不是假装集成测试
+  覆盖了它。
+
+45 checks, 0 failed（`clang++ -std=c++20 -O1`，这台 Mac arm64 上，CPU-only）。
+
+## 架构待决（已回到 Tectonic 侧确认，见上面 2026-11-18 小节）：`gen`/`delta`/`done` 和 BoundaryFrame 是什么关系
 
 这是挡住并发调度层（`run_slot_rows` 接入）的真正问题，不是"不知道怎么写代码"，是"不知道这段
 代码该做什么"，所以这次没有自己拍板，留给下一次有权衡依据时再定：
