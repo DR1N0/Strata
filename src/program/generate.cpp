@@ -4756,7 +4756,14 @@ int main(int argc, char** argv) {
         // the whole 8K prompt back into 4 chunks (measured: 2048 against 8192 costs ~26% of an 8K prompt on this box).
         o.prefill_chunk = o.prefill_own_keep_chunk ? o.prefill_chunk : 2048;
     }
-    if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
+    // Tectonic (ADR 0005 addendum): --tectonic requests bring their own tokens too, via the
+    // EntryBridge's gen messages, not this CLI parse - same reason --serve is exempted here, and the
+    // same placeholder values (this early validation/setup code, shared by every mode, bounds-checks
+    // against these before --tectonic's own stage_worker_run dispatch ever runs, which is what
+    // actually drives generation for that mode and ignores these CLI-level values). Found by running
+    // the real daemon against the real binary, not by review - no prior round's test ever launched
+    // through main() with no --tokens on the command line the way internal/node.StartWorker does.
+    if (!have_tokens && (o.serve || o.tectonic)) {
         o.tokens = {248045};
         o.max_new = 1;
         have_tokens = true;

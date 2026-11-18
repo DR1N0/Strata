@@ -590,6 +590,33 @@ Tectonic 的 `engine.md` 契约里，`gen` 请求带 `tokens[]`/`max_new`/`sampl
 推断。**这个问题需要回到 Tectonic 的设计讨论里确认，不是引擎这边能单方面决定的**，因为答案决定
 的是 daemon 侧要不要再转发张量、mesh wire v3/v4 要不要继续存在。
 
+## 2026-11-19（续四）：真实 `tectonicd` 第一次连上真实二进制，发现并修好第六个真问题
+
+前几轮的验证都是用独立测试程序（`tools/test_tier1_concurrency.cpp`、临时的 `tier15_*.py`）直接驱动
+`stage_worker_run`，从没有真的让 Tectonic 的 `internal/node.StartWorker` 启动这个二进制、走它自己
+构造的完整命令行。这一轮把 `tectonicd`/`tectonic` 两个 Go 命令、这个仓库刚修好的真实二进制
+（`09e21ed13`）、真实 Qwen3.8-Flash-Next 模型、真实转换出来的 tokenizer 全部接起来跑了一次。
+
+**发现并修了第六个真问题**：`generate.cpp` 对`--tokens`有一条硬性检查——没传就报错退出
+（"--tokens is required"），**这条检查只对 `o.serve` 做了豁免**（`!have_tokens && o.serve` 时填一个
+占位 token 继续跑，因为 `--serve` 的 prompt 是每个 HTTP 请求自己带来的，不经过这个 CLI 参数）。
+`--tectonic` 同样是"prompt 经 `EntryBridge` 的 `gen` 消息带来，不经过这个 CLI 参数"的情形，但从来
+没有被加进这条豁免——和之前的 `--batch` gate bug（`60632197c`）是同一个模式：**`--serve` 已经踩过
+的坑，`--tectonic` 接入时没有对照着补上同一个豁免**。真正跑 `internal/node.StartWorker` 构造的、
+不带 `--tokens` 的命令行才触发，之前所有测试要么手写命令行带了占位值，要么走的是独立测试程序，
+从没真的复现过这条路径。
+
+修法和 `--batch` gate 那次一样：把条件从 `o.serve` 改成 `o.serve || o.tectonic`，复用 `--serve` 已经
+验证过的占位值（`o.tokens = {248045}`，这个 pack 里是 `<|im_start|>`，一个安全的特殊 token）。
+
+**验证**：真实握手、真实 48 层模型在 Apple M3 Max 上加载、真实一轮 chat completion 跑通，模型对
+"Say hello in exactly three words" 给出的最终答案是"Hello there friend"（确实三个词，`</think>`
+推理块之后）——`EntryBridge` 不做 EOS 检测这一条已知、刻意的缺口（见上面的 scope cut 记录）照常
+出现：模型越过 `<|im_end|>` 继续编了一轮新对话，这是已经记录过的行为，不是这次发现的新问题。
+
+这是 wire v4／Tier 1／Tier 1.5／真实 `Verifier` 绑定这条工作线第一次有"从 Tectonic 的两个 Go 命令
+发起，到真实模型真实产出一个正确答案"的完整端到端证据，不只是某一段链路的真实计算证据。
+
 ## 维护规则
 
 1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。哪怕代码要贴着引擎写，
