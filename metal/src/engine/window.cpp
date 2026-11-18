@@ -2400,6 +2400,25 @@ void Window::reset() {
         zero(tail_[j], TAIL_B);
         zero(dead_[j], DEAD_B);
     }
+    // Tectonic: the QSA indexer's pooled (block-summary) rows were the one state buffer this function left
+    // unzeroed - the CUDA/HIP path's qsa_state_zero (src/core/layer.cpp) explicitly zeroes the equivalent
+    // (st.idx_pooled), for the same reason it zeroes the PLE conv history elsewhere in this file's own
+    // comments: a stale row is a real, retrievable contribution to the indexer's routing, not an absent one.
+    // A second conversation reusing this Window's solo set (--tectonic: a fresh request after a prior one
+    // already ran) read the first conversation's leftover pooled rows here and produced wrong output -
+    // found by running real decode compute against known-good output, not by review.
+    for (size_t j = 0; j < pooled_.size(); ++j) zero(pooled_[j], pooled_[j].bytes);
+    // DIAGNOSTIC (TECTONIC_DEBUG): also zero K/V, to test whether the generic path's K/V zeroing in
+    // qsa_state_zero is load-bearing here too, contrary to the "position-bounded reads don't need it"
+    // assumption - pooled_ alone did not fix the observed second-conversation corruption.
+    if (std::getenv("TECTONIC_DEBUG_ZERO_KV")) {
+        for (size_t j = 0; j < kq_.size(); ++j) {
+            zero(kq_[j], kq_[j].bytes);
+            zero(vq_[j], vq_[j].bytes);
+            zero(ksc_[j], ksc_[j].bytes);
+            zero(vsc_[j], vsc_[j].bytes);
+        }
+    }
     for (size_t j = 0; j < mtail_.size(); ++j) {
         zero(mtail_[j], TAIL_B);
         zero(mdead_[j], DEAD_B);

@@ -21740,9 +21740,15 @@ int main(int argc, char** argv) {
         auto prefill_stage = [&](int slot, const int32_t* tokens, int64_t n, int64_t pos0, const float* hand_rows,
                                  int64_t hand_elems, const strata::program::StageWorkerEmit& emit,
                                  std::string& pe) -> bool {
-            (void) slot;   // prefill always runs on the shared solo Prefill/ss - see its declaration comment
+            // prefill always runs on the shared solo Prefill/ss - see its declaration comment
             strata::prefill::Prefill& pf = stage_prefill;
             std::vector<int64_t> toks(tokens, tokens + n);
+            if (std::getenv("TECTONIC_DEBUG_COMPUTE")) {
+                std::fprintf(stderr, "DBG prefill_stage: slot=%d n=%lld pos0=%lld tokens=[", slot, (long long) n,
+                             (long long) pos0);
+                for (int64_t i = 0; i < n; ++i) std::fprintf(stderr, "%lld,", (long long) toks[(size_t) i]);
+                std::fprintf(stderr, "]\n");
+            }
             if (hand_rows != nullptr) {
                 if (hand_elems != stage_hc_n) { pe = "stage: the prompt rows are not this stage's shape"; return false; }
                 pf.set_hand_in(hand_rows);       // this stage starts from its predecessor's rows
@@ -21798,6 +21804,7 @@ int main(int argc, char** argv) {
         // wrong slot's session, would convolve one request's first rows with another's, and the output would
         // still look like text.
         auto reset_stage = [&](int slot, std::string& re) -> bool {
+            if (std::getenv("TECTONIC_DEBUG_COMPUTE")) std::fprintf(stderr, "DBG reset_stage: slot=%d\n", slot);
             // Always zeroes the shared solo session (`ss`), not slot_sessions[slot]: prefill and the first
             // decode step always run solo (see prefill_stage/compute_stage) - see this block's declaration
             // comment on why that is correct, not a shortcut. This slot's OWN buffer is stale until the
@@ -21833,6 +21840,10 @@ int main(int argc, char** argv) {
             drive.d.failed = false; drive.d.layers = 0; drive.d.experts = 0;
             int32_t sampled = -1;
             const bool primed = (size_t) slot < slot_primed.size() && slot_primed[(size_t) slot];
+            if (std::getenv("TECTONIC_DEBUG_COMPUTE")) {
+                std::fprintf(stderr, "DBG compute_stage: slot=%d token_in=%d pos=%lld primed=%d\n",
+                             slot, token, (long long) pos, (int) primed);
+            }
             if (!primed) {
                 // First decode step for this slot since its last reset: run solo (same session/path the
                 // prefill just used), then copy the resulting state into the slot's own Metal-window buffer
@@ -21861,6 +21872,9 @@ int main(int argc, char** argv) {
                     if (re.empty()) re = "stage: expert worker failed"; return false;
                 }
                 sampled = outs[0];
+            }
+            if (std::getenv("TECTONIC_DEBUG_COMPUTE")) {
+                std::fprintf(stderr, "DBG compute_stage: slot=%d pos=%lld sampled=%d\n", slot, (long long) pos, sampled);
             }
             if (o.layer_end < g.n_layers) {
                 if (!stage_ver.boundary_capture(output, 1, pos, main_cs, re)) return false;

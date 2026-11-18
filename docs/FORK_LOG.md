@@ -362,6 +362,123 @@ ping-pong 缓冲的奇偶标记；`session_zero` 显然没有重置这个——�
   （至少跑到了正确绑定真实 Verifier 这一步，没有在调度层面翻车）；真正的"多 slot 同时装着不同
   conversation 的真实计算"这件事，这一轮做到了单 slot 完全正确，多 slot 还有一个未解决的真 bug。
 
+## 2026-11-19（续二）：diagnose 第二个 slot 的 bug——定位更精确了，根因仍未找到
+
+上一节报告的 bug 这次重新测量后发现描述得不够准：不是"第二个 *slot 编号*"，是**"这个
+`stage_ver`/`Window` 实例上，第二次跑 solo prime 流程（不管中间有没有发生过 `run_slot_rows`，
+不管这次用的是不是同一个 slot 编号），永远错；第一次永远对"**。两个证据：
+
+- 顺序测试（A 跑完整个会话、释放 slot，B 才开始）：加了 `TECTONIC_DEBUG_COMPUTE=1` 跟踪后，**A 和
+  B 都被分到了 slot 0**（`ensure_slot` 找最小的空闲编号，A 释放后 B 自然又拿到 0）——这推翻了
+  "slot 1 比 slot 0 有问题"这个假设。
+- 并发测试：B 这次确实拿到了 slot 1（A 还占着 slot 0），但 B 的 unprimed（solo）第一步**在 A 的任何
+  `run_slot_rows` 调用之前**就已经错了——这推翻了"是 batch 路径弄脏了后面的 solo 调用"这个假设，
+  因果顺序对不上。
+
+两次测试共同点：错的那次调用，之前这个 `stage_ver` 已经**至少完整跑过一次 solo prime
+（`run(1,...)` + `commit(1,...)` + `window_slot_copy_main`）**，不管这次之后发生过 `run_slot_rows`
+与否。
+
+### 具体错成什么样：精确到 position 级别，不是"乱码"
+
+`TECTONIC_DEBUG_COMPUTE=1` 完整单请求/双请求 trace（见下方，命令可复现）显示 B 的输出不是随机垃圾，
+是一个精确的规律：
+
+```
+位置(pos)  真实喂入的 token   应该预测    实际预测
+  2           30 (prompt最后一个)   198        10
+  3           10 (上一步采样值)      10         20
+  4           20                    20         30
+  5           30                    30         10
+```
+
+把"实际预测"对齐到"这个 token 在原 prompt 里的位置"看：**`predict(pos) == token_at(pos − 2)`**——
+每一步预测的都是"当前位置往前数 2 格"喂进去的那个 token，不是真正的模型推理结果，像是在读一个
+没清干净、位置整体偏移了 2 的缓冲区。"2" 这个数字和 `--spec 2`（这个 pack 强制要求，决定
+`Verifier::init` 的 `max_t=2` speculative 窗口大小）数值相同——这**是一个值得继续查的线索，不是
+结论**，没有验证过两者的因果关系。
+
+### 排查 `hp_`（"history parity"）：读懂了，但排除了它单独作为根因
+
+`metal/src/engine/window.cpp:499` 声明 `int hp_ = 0;`——**这是 `Window` 一个进程/实例全局的字段，
+不是每个 slot 自己的**（每个 `SeqSet` 另有自己的 `o.hp`，两者是两回事）。读了每一处用到它的函数：
+
+- `Window::finish`（`window.cpp:2049`，solo 单序列路径用）：`if (Tn == 1) hp_ = 1 - hp_;`——**每次
+  solo 单 token 推理都会把这个全局 parity 翻转一次**。
+- `Window::finish_rows`（`window.cpp:1656`，batch/`run_slot_rows` 路径用）：只翻转
+  `s.hp`（对应 slot 自己的字段），**完全不碰全局 `hp_`**。
+- `Window::slot_copy`（`copy_to_slot`/`window_slot_copy_main` 背后的实现，`window.cpp:2295-2301`
+  一带）：`const int hs = into_slot ? hp_ : o.hp;`——拷贝进 slot 时，用的是**当前全局 `hp_`** 决定
+  从 `ghist_[hs]` 还是 `ghist_[1-hs]` 读；拷贝完顺手 `o.hp = hp_`，把这次的 parity 记到 slot 自己
+  头上。
+
+**`session_zero`（Metal 路径是 `window_reset`→`Window::reset()`，`window.cpp:2387`）不重置 `hp_`
+本身**，但它确实把 `ghist_[0]` 和 `ghist_[1]` **两个 parity 的内容都清零**（`window.cpp:2393-2397`）。
+这意味着：不管 `hp_` 当前指向 0 还是 1，`reset()` 之后两边都是干净的零——**这排除了"hp_ 读到另一个
+会话留下的脏历史"这个最初的假设**，因为两边都被清过。
+
+### 验证过、确认没用的两个尝试
+
+1. **补 `Window::reset()` 漏掉的 `pooled_`（QSA indexer 的"pooled"块摘要）清零**（`window.cpp:2410`
+   附近，已提交）。这是读 `src/core/layer.cpp:981` 的 CUDA/HIP 版 `qsa_state_zero` 时发现的真实、
+   独立成立的缺口——CUDA/HIP 那边显式 `cudaMemsetAsync(st.idx_pooled, ...)`，Metal 的 `reset()`
+   从来没有对应这一步（`tail_`/`dead_` 清了，`pooled_` 没清）。**这是一个真实的、值得保留的正确性
+   修复，但单独加上去之后，`tier15_sequential_test.py` 的结果完全没变**——不是这次报告 bug 的根因，
+   是另一个（更小、更隐蔽，可能从未被触发过，因为大多数真实场景下 pooled 的陈旧内容恰好不会被路由
+   选中）独立缺口。保留这个修复，但不claim它解决了本节的问题。
+2. **额外再清 K/V（`kq_`/`vq_`/`ksc_`/`vsc_`）**（`TECTONIC_DEBUG_ZERO_KV=1`，诊断用，默认关闭，
+   未提交为默认行为）：同样测过，结果没变。这与"K/V 按位置读写，不需要清零"的原有假设一致，但既然
+   `pooled_` 的假设也错了，这次是真测过，不是凭这条假设就不测。
+
+### 第三条路：`--serve` 自己的准入流程，没有发现额外步骤
+
+重新读了 `--serve` 的 `BGEN`/`admit_slot`/`copy_to_slot`（`generate.cpp:16784-16797`、`15687`
+附近）：**它的准入机制和这次 `--tectonic` 用的完全一样**——先在 solo 路径（同一个 `ss`/`stage_ver`）
+跑完 prompt 和第一个 token，调用方（`serve/server.py`）用 `BGEN <slot> <max_new>` 显式指定目标
+slot，引擎侧调用的还是同一个 `window_slot_copy_main`。**没有找到"`--serve` 在 solo prime 和
+copy-to-slot 之间多做了一步我们没做"的证据**——这要么说明这个 bug 在 `--serve` 的真实生产使用里
+同样存在、只是没被这种"同一个 Verifier 连续接两个全新会话"的用法模式触发过，要么说明问题出在
+`--tectonic` 这边更靠后、更隐蔽的地方，两种可能都没有被这一轮排除。
+
+### 第四条路：上游的真实先例
+
+`origin`（`Niko1221/Strata`，公开仓库，`gh issue list --repo Niko1221/Strata` 可查）上有一个直接
+相关的真实案例，**同一个子系统，同一类缺陷形状，不同的具体字段**：
+
+> **#4908**「Metal batch slots (0.2.9): a picture request decodes other text once another
+> request joins (slot rows rotate without M-RoPE)」——`--vision` 场景下，一张图片请求单独跑是对的，
+> 第二个请求一起进 batch slot 就错；原因是 `qsa_prep` 的 function constant 只带了 slot-rows 版本
+> （30），没带 M-RoPE 版本（24），导致每个 slot row 按"纯 cell 位置"转而不是按"M-RoPE 位置"转。
+> 报告者给出的修复方案：**每个 slot 自己留一份 M-RoPE 表，`slot_copy` 时把准入请求的表拷贝进去**——
+> 和这次 `pooled_` 缺口的修复形状完全一样（"`slot_copy`/`reset` 漏了一块该搬/该清的状态"）。
+
+这不是同一个 bug（我们没用 `--vision`/M-RoPE），但确认了一件事：**"Metal 的 batch slot 机制有
+某块状态没有被 `slot_copy`/`reset` 正确搬运或清零"是这个代码库里真实发生过、有真实先例、有真实
+修复模式的一类问题，不是本轮凭空怀疑**。没有搜到和本次文本场景（QSA pooled、无 vision）完全对应
+的已知 issue。
+
+### 复现命令（供下一轮直接跑，不用重新搭）
+
+```
+cd ~/projects/strata
+cmake -S metal -B /tmp/strata-build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DMETAL_CPP_DIR=/Users/haiyuwang/models/ds41/downloads/metal-cpp-26.4-unpacked.cqlcx4su/metal-cpp-c595afef4a5dc388f4047cd0c69f9e7f9468d9ed
+ninja -C /tmp/strata-build-metal strata
+TECTONIC_DEBUG_COMPUTE=1 python3 /tmp/tier15_sequential_test.py   # 若 /tmp 已清空，脚本内容见本节此前的 commit message / 对话记录
+```
+
+### 诚实的定性：这不是"快速修完"的问题
+
+两个独立的、读代码读出来、看起来很有道理的假设（`hp_`/`ghist_` 陈旧，`pooled_`/K-V 没清零）都被
+真实跑分真实模型**证伪**了，不是"还没来得及测"。剩下的"predict(pos) = token_at(pos−2)"这个精确
+规律指向某个和 `--spec 2`/`max_t=2` 的 speculative 窗口捕获（graph capture/replay）或者 QSA
+indexer 的路由逻辑有关的、更底层的状态复用问题，但这两个方向都需要继续深挖
+（`capture_batch`/`record_window`/窗口图缓存键，或者 indexer 具体怎么决定"看哪些 cell"），不是
+再加一行 `memset` 就能验证的假设了。上游 #4908 的先例说明这类 bug 修起来通常是"找到那一块多出来的
+专属状态，让 slot_copy 搬一份"，但这次已经验证过的几块（pooled、K/V、ghist 双 parity）都不是，
+说明还没找到那一块。**不建议现在就投入更多时间盲试下一个假设，比较值得的下一步是要么上 Metal 的
+GPU 调试工具直接看缓冲区内容，要么把这个现象整理成一个新 issue 发给上游，参考 #4908 的格式**。
+
 ## 架构待决（已回到 Tectonic 侧确认，见上面 2026-11-18 小节）：`gen`/`delta`/`done` 和 BoundaryFrame 是什么关系
 
 这是挡住并发调度层（`run_slot_rows` 接入）的真正问题，不是"不知道怎么写代码"，是"不知道这段
