@@ -274,6 +274,94 @@ Tectonic 侧提出一个具体场景：多个 stage 顺序处理同一个请求�
 连续三次独立运行：16 个传输窗口里分别找到 13、14、15 个重叠——不是边界运气，是稳定可复现的真实
 时间重叠，不是"先后完成看起来像并发"。64 checks, 0 failed（含 A/B/C 三节）。
 
+## 2026-11-19（续）：`generate.cpp` 接真实 `Verifier`——真实单请求正确，真实双请求仍有未解决的 bug
+
+上一节的 slot 调度逻辑一直是用假 compute 验证的；这次任务是把 `compute`/`reset`/`prefill` 回调接到
+`generate.cpp` 的真实 `Verifier`/`SessionState`/`Prefill`，并且**要求真实模型、真实 decode 计算的
+证据**，不能停在"编译通过"。过程中发现并修了四个真问题，第五个只修对了一半——如实记录，不夸大。
+
+### 先确认：真实二进制当时编译不过
+
+`f526d5005` 改了 `StageWorkerCompute`/`Reset`/`Prefill` 的签名（加 `slot` 参数），但没有同步改
+`generate.cpp` 的 `--tectonic` 分支——`compute_stage`/`reset_stage`/`prefill_stage` 三个 lambda
+还是旧签名。真实 `strata` 二进制（不是 `tools/test_tier1_concurrency.cpp` 那个不碰 `generate.cpp`
+的独立测试）在这次之前编译不过。用 `clang++ -c`（真实对象文件，不是 `-fsyntax-only`）确认过。
+
+### 做了什么，按发现顺序
+
+1. **把三个回调的签名和调用点改成 slot-indexed**（本来就是这次任务要做的事）：`n_slots` 个独立
+   carve 的 `SessionState`（`session_bytes`/`session_init`，和本文件已有的多 GPU "stages" 循环
+   同一个模式，不是发明新机制）；`Verifier::init_slots(slot_sessions, err)`。
+2. **发现并修：`metal/CMakeLists.txt` 没把 `entry_bridge.cpp` 列进 `STRATA_METAL_HOST_SOURCES`**。
+   `ceee43bd9` 加了这个文件但没同步 CMake 源文件列表，这次用真的 `cmake -S metal -B ... -G Ninja`
+   （装了 `cmake`/`ninja`，这台环境原来没有）配置+构建才链接报错发现——这是另一处预先存在的缺口，
+   不是本轮引入的。已修：加一行。
+3. **发现并修：`--batch` 这个 gate 从来没打算支持 `--tectonic`**。`generate.cpp` 里有一条校验
+   `!o.serve ? "it needs --serve" : ...`，不是 `--serve` 就把 `o.batch` 静默清零成 0——这条校验写
+   在 `--batch` 还只给 `--serve` 用的年代，`--tectonic` 读 `o.batch` 这件事（`wc.batch = n_slots`）
+   从来没真正被这条校验放行过。真实跑 `--batch 2` 才发现"2 个 slot"从没真正到过 `init_slots`。
+   已修：改成 `!o.serve && !o.tectonic`。
+4. **发现并修：`generate.cpp` 从来没有构造 `EntryBridge` 并挂到 `wc.entry_bridge`**。
+   `stage_worker_run` 收到非 `BoundaryFrame` 字节时，`c.entry_bridge == nullptr` 直接拒绝——
+   `ceee43bd9` 加了 `EntryBridge` 类，但 `--tectonic` 分支从没构造过一个。真实跑才报错发现；修法是
+   `layer_begin == 0` 时构造一个局部 `EntryBridge` 并赋给 `wc.entry_bridge`。
+5. **发现但只修对了"单请求"：`SessionState*` 指针身份不等于 Metal window 的 batch slot 身份**。
+   这是这次最深的坑，也是过程最长的部分：
+   - 最初以为"每个 slot 一个独立 carve 的 `SessionState`，`Prefill`/`session_zero`/`run_slot_rows`
+     都直接传这个指针"就够了——单 slot (`--batch 1`) 测试给出 `[16,15,1088,88396]`，不是真实 ground
+     truth `[4,5,6,24218]`（prompt `[1,2,3]`，和本仓库 `docs/archive`/Tectonic 仓库
+     `DUAL_MACHINE_L0_20261113.md` 记录的参考值一致）。
+   - 先排除"是 entry bridge 拆帧错了"：把 `compute_stage` 临时改回最早的单会话 `stage_ver.run(1,...)`
+     + `commit(1,...)`（完全不碰 slot），同一套 entry bridge 拆帧逻辑，结果就是对的
+     （`[4,5,6,24218]`）——说明 entry bridge 本身没问题，问题在 `run_slot_rows` 这条路径。
+   - 读 `metal/src/engine/window.cpp` 的 `Window::slots_init`/`run_slots`/`slot_copy`，加上
+     `src/program/generate.cpp` 里 `--serve` 自己的 `copy_to_slot`（约 15687 行）才搞清楚：
+     **Metal 后端的 batch slot 是 `Window` 内部单独 carve 的 GPU buffer 集合（`sets_[1..N]`），
+     和传给 `init_slots` 的 `SessionState*` 指针身份无关**——`Prefill`/`session_zero`/单会话
+     `run()` 实际操作的是 `Window` 的"live"（也就是 `sets_[0]`，`ss_` 别名）那一份缓冲区，不是
+     按指针寻址到某个 slot 的缓冲区。要让一个 batch slot 真的有内容，必须显式
+     `strata::metal_engine::window_slot_copy_main(true, slot, upto, false, err)`——`--serve`
+     自己的 `copy_to_slot` 就是干这个的，不是"续接旧对话"专属机制，是"往 slot 里第一次写入内容"
+     本身依赖的机制，这是我最初漏看的一点。
+   - 改法：prefill 和每个请求的**第一次** decode 仍然跑在共享的 solo `ss`/`stage_prefill` 上（和
+     改动前的原始单会话代码完全一样的路径），紧接着显式 `window_slot_copy_main(true, slot, pos+1,
+     false, err)` 把结果搬进目标 slot，之后该 slot的后续 decode 步骤才用 `run_slot_rows`。每个
+     slot 一个 `bool slot_primed` 标志位记这个状态，`reset_stage` 时清掉。
+   - **验证：单请求现在完全正确**。`tier15_single_test.py`（真实 Qwen3.8-Flash-Next pack、真实
+     Metal 计算、`--batch 1`）：`done.tokens = [4,5,6,24218]`，和 ground truth 字节级一致。
+
+### 没能修完：第二个 slot 的结果仍然错，和"是否并发"无关
+
+加了 solo-then-copy 之后，两个请求**真正并发交替**跑（`tier15_real_test.py`，`--batch 2`，prompt
+`[1,2,3]` 和 `[10,20,30]`）：req-a 正确拿到第一个 token（4），之后错；req-b 从第一个 token 就错
+（`[10,20,30,10]`，不是 ground truth `[198,10,20,30]`）。为了排除"是并发交织把状态搞乱了"，写了
+`tier15_sequential_test.py`：**同一个进程里，A 完全跑完、释放 slot 之后再发 B**，结果一样——
+`req-a` 正确，`req-b` 还是 `[10,20,30,10]`。
+
+**这排除了"并发/交织"假设，把问题精确缩小到："这个进程生命周期里，第二个被用到的 slot，不管是不是
+并发，结果都错；第一个永远对。"** 没有继续深挖下去——怀疑和 `Window` 内部某个全局的、跨 slot 共享
+的生成计数/奇偶状态有关（读 `slot_copy` 时见过 `hp_`/`o.hp`，"history parity"，按注释是某种
+ping-pong 缓冲的奇偶标记；`session_zero` 显然没有重置这个——但这是没有验证过的假设，不是结论）。
+留了一个调试钩子在 `src/core/verify.cpp` 的 `slot_row_draw`（环境变量 `TECTONIC_DEBUG_SLOT_DRAW=1`
+打印采样参数，排除了"第二个 slot 采样配置不对"这个曾经的假设——结果显示采样参数本身是对的，问题在
+更早的计算阶段，不在 `slot_row_draw`），给下一轮继续查的人留个起点，不是本轮的待办项。
+
+### 这一轮实际验证到的程度，不要读多也不要读少
+
+- **真实构建**：`cmake -S metal -B ... && ninja`，真实 Metal 后端，真实 `strata` 二进制，链接成功、
+  能跑。
+- **真实模型、单请求、真实 decode compute**：`/Users/haiyuwang/models/qwen38/native-pack-v_q0u84a`
+  （Qwen3.8-Flash-Next IQ3_XXS），`--batch 1` 和 `--batch 2`（仅用其中一个 slot）下，结果都和
+  solo（非 `--tectonic`）跑同一个 prompt 的输出字节级一致，且和 Tectonic 仓库
+  `DUAL_MACHINE_L0_20261113.md` 记录的参考值一致。**这是本轮达到的、有真实分量的正确性证据**。
+- **真实模型、两个请求同时在途**：**没有验证通过**。第二个 slot 的结果错，和并发/串行无关，根因
+  没找到。`tools/test_tier1_concurrency.cpp` 的假 compute 测试（64+191 checks）不受影响，仍然全过，
+  但那测的是调度逻辑，不是这次新发现的真实计算 bug——**不能拿假 compute 测试通过当作"多 slot 真实
+  计算正确"的证据，这两者是不同的问题**。
+- 结论：Tier 1.5 的调度层（wire v4 的 request_id 分发、slot 准入、读线程）在真实引擎上被证明是对的
+  （至少跑到了正确绑定真实 Verifier 这一步，没有在调度层面翻车）；真正的"多 slot 同时装着不同
+  conversation 的真实计算"这件事，这一轮做到了单 slot 完全正确，多 slot 还有一个未解决的真 bug。
+
 ## 架构待决（已回到 Tectonic 侧确认，见上面 2026-11-18 小节）：`gen`/`delta`/`done` 和 BoundaryFrame 是什么关系
 
 这是挡住并发调度层（`run_slot_rows` 接入）的真正问题，不是"不知道怎么写代码"，是"不知道这段

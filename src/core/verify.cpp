@@ -4928,6 +4928,14 @@ int Verifier::slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, co
     const bool bias = sp.logit_bias != nullptr;
     hist = nullptr;
     hlen = 0;
+    if (const char* dbg = std::getenv("TECTONIC_DEBUG_SLOT_DRAW")) {
+        (void) dbg;
+        std::fprintf(stderr, "DBG slot_row_draw: t=%d last_rows[t]=%d slot_sp_.size()=%zu greedy=%d temp=%f pen_last_n=%d "
+                             "pen_repeat=%f pen_freq=%f pen_present=%f bias=%p last_pos_b[t]=%lld last_tokens[t]=%d\n",
+                     t, last_rows_[t], slot_sp_.size(), (int) sp.greedy, sp.temperature, sp.penalty_last_n,
+                     sp.penalty_repeat, sp.penalty_freq, sp.penalty_present, (void*) sp.logit_bias,
+                     (long long) last_pos_b_[t], last_tokens_[t]);
+    }
     if ((sp.greedy || sp.temperature <= 0.0f) && !pen && !bias) return 0;   // a plain greedy slot keeps the window's argmax token untouched
     sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
     if (!pen) { sp.penalty_last_n = 0; return 1; }

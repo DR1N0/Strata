@@ -7541,7 +7541,14 @@ int main(int argc, char** argv) {
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
-        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
+        // Tectonic (ADR 0005 addendum, "Tier 1.5"): this gate predates --tectonic ever reading --batch
+        // (see StageWorkerConfig::batch's own comment and the --tectonic block's n_slots) - it only knew
+        // about --serve's own batch windows. --tectonic's slot-indexed decode has the same "needs 2+
+        // slots on one stage" shape --serve's does, so it belongs on the same side of this check, not
+        // behind a --serve-only gate that would silently zero --batch back to single-session decode for
+        // every --tectonic run before the --tectonic block ever sees it - found by running the real
+        // binary with --batch 2, not by code review.
+        const char* off = !o.serve && !o.tectonic ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch %d is off: %s\n", o.batch, off);
@@ -21638,6 +21645,30 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "stage: explicit stage range required (--layers); local multi-GPU not supported\n");
             return 2;
         }
+        // Tectonic (ADR 0005 addendum, "Tier 1.5"): n_slots independently resident SessionStates, one per
+        // stage_worker_run slot (see its StageWorkerCompute/Reset/Prefill comments) - slot 0 reuses `ss`,
+        // the session the shared setup above already carved for this stage's layer range; slots 1..n_slots-1
+        // are carved here the same way (session_bytes/session_init), matching the multi-GPU "stages" loop's
+        // own pattern a few hundred lines up, which is the established precedent for "more than one session,
+        // same carve function" in this file - not something invented for this change. These sessions are
+        // read/written by at most one stage_worker_run compute() call at a time (that loop is single-threaded;
+        // "interleaved" means temporally alternating across calls, never two calls in flight together), so no
+        // locking is needed here beyond what session_zero/run_slot_rows already assume for a single caller.
+        const int n_slots = o.batch > 0 ? (int) o.batch : 1;
+        std::vector<strata::core::SessionState> extra_sessions((size_t) std::max(0, n_slots - 1));
+        for (auto& s : extra_sessions) {
+            void* sbuf_slot = nullptr;
+            if (cudaMalloc(&sbuf_slot, strata::core::session_bytes(g, o.max_context, K, o.layer_begin, o.layer_end)) !=
+                    cudaSuccess ||
+                strata::core::session_init(g, o.max_context, K, sbuf_slot, s, o.layer_begin, o.layer_end) == 0) {
+                std::fprintf(stderr, "stage: a batch slot's session state failed\n"); return 1;
+            }
+            s.ple.hist = s.ple_hist;   // mirrors the shared setup's own line for `ss`, same reason
+        }
+        std::vector<strata::core::SessionState*> slot_sessions;
+        slot_sessions.push_back(&ss);
+        for (auto& s : extra_sessions) slot_sessions.push_back(&s);
+
         const int64_t stage_hb = strata::core::Verifier::handoff_floats(g);
         float* stage_hand = nullptr;
         if (cudaHostAlloc((void**)&stage_hand, (size_t)stage_hb * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
@@ -21657,6 +21688,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "stage: verifier init: %s\n", err.c_str()); return 1;
         }
         stage_ver.set_sampling(sp);
+        // Tier 1.5: every compute() call below is a one-row batch window (S=1) against whichever slot the
+        // caller names - never Tier 2's kernel-level fusion of several slots into one call (ADR 0005). This
+        // is the real precedent FORK_LOG.md cites: init_slots/run_slot_rows exist for exactly this, S=1 is a
+        // degenerate (not special-cased) input to the same function --serve's own scheduler already uses.
+        if (!stage_ver.init_slots(slot_sessions, err)) {
+            std::fprintf(stderr, "stage: verifier init_slots: %s\n", err.c_str()); return 1;
+        }
         // THE PROMPT PATH FOR THIS STAGE. `Verifier::run` tops out at kWindowMaxT (8-16 rows) because that is a
         // decode window, so a prompt cannot go through it without degenerating to one position per frame. Prefill
         // is the engine's chunked reader: given the whole prompt it walks it in chunks and hands each chunk's rows
@@ -21665,9 +21703,6 @@ int main(int argc, char** argv) {
         // The engine's own counters go wherever the active path keeps them; the compute callback cannot know which.
         int64_t* experts_out = &worker_stats.experts_streamed;
         int64_t* filebytes_out = &worker_stats.file_read_bytes;
-        strata::prefill::Prefill stage_prefill;
-        stage_prefill.set_cpu_pool(&pool);
-        stage_prefill.set_stage(o.layer_begin, o.layer_end >= g.n_layers ? -1 : o.layer_end, nullptr);
         // No borrowed buffers: the loan machinery exists to fit a prompt's temporary rows inside the expert cache,
         // and borrowing is the part of the single-machine path most entangled with per-run planning. Until this
         // path is measured, the conservative own-buffer form is the one worth trusting.
@@ -21678,24 +21713,45 @@ int main(int argc, char** argv) {
         // 512-row frames on the way out.
         const int64_t stage_chunk = 2048;
         const int64_t stage_frame_rows = 512;
+        // ONE shared Prefill, bound to `ss` only - NOT one per slot (an earlier version of this change tried
+        // that; it was wrong, found by actually running real decode compute, not by review). The Metal
+        // window's batch slots are NOT addressed by SessionState pointer identity: `Verifier::init_slots`
+        // carves each slot its own separate GPU buffer set (metal/src/engine/window.cpp's `slots_init`),
+        // distinct from the "solo" set `ss`/`stage_ver` already use. Prefill (and the first decode step)
+        // must run on the solo set as before, and the result is explicitly copied into the target slot with
+        // `window_slot_copy_main` (exactly --serve's own `copy_to_slot` admission step - see
+        // src/program/generate.cpp's own --serve code around `auto copy_to_slot = ...`) before any later
+        // decode step for that slot can use `run_slot_rows` - see compute_stage below for where that split
+        // happens. This is consistent with prefill already being strictly serialized across slots (the
+        // separability finding in FORK_LOG.md's 2026-11-19 section): there is only ever one "solo" prefill
+        // in flight, so one shared Prefill object is correct, not a simplification that cuts a corner.
+        strata::prefill::Prefill stage_prefill;
+        stage_prefill.set_cpu_pool(&pool);
+        stage_prefill.set_stage(o.layer_begin, o.layer_end >= g.n_layers ? -1 : o.layer_end, nullptr);
         if (!stage_prefill.init(wt, g, ss, srcp, &xcache, host_res.empty() ? nullptr : host_res.data(),
                                stage_chunk, main_cs, err, nullptr, 0, false)) {
             std::fprintf(stderr, "stage: prefill init: %s\n", err.c_str()); return 1;
         }
+        // Per-slot: has this slot's own Metal-window buffer ever been populated by a copy-in yet? False
+        // after every reset_stage (a new request takes the slot and must re-run solo + copy-in before any
+        // run_slot_rows call can read that slot's buffer correctly) - see compute_stage.
+        std::vector<bool> slot_primed((size_t) n_slots, false);
         const int64_t stage_hc_n = (int64_t) g.hc * g.n_embd;
-        auto prefill_stage = [&](const int32_t* tokens, int64_t n, int64_t pos0, const float* hand_rows,
+        auto prefill_stage = [&](int slot, const int32_t* tokens, int64_t n, int64_t pos0, const float* hand_rows,
                                  int64_t hand_elems, const strata::program::StageWorkerEmit& emit,
                                  std::string& pe) -> bool {
+            (void) slot;   // prefill always runs on the shared solo Prefill/ss - see its declaration comment
+            strata::prefill::Prefill& pf = stage_prefill;
             std::vector<int64_t> toks(tokens, tokens + n);
             if (hand_rows != nullptr) {
                 if (hand_elems != stage_hc_n) { pe = "stage: the prompt rows are not this stage's shape"; return false; }
-                stage_prefill.set_hand_in(hand_rows);       // this stage starts from its predecessor's rows
+                pf.set_hand_in(hand_rows);       // this stage starts from its predecessor's rows
             } else if (o.layer_begin > 0) {
                 pe = "stage: a non-entry stage needs the prompt's rows"; return false;
             }
             // ONE FRAME PER CHUNK, CUT SMALLER IF NEEDED. Prefill wants chunks big enough that its per-chunk cost
             // disappears; the wire wants frames small enough for the peer to buffer. Those are different limits.
-            stage_prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+            pf.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
                 if (o.layer_end >= g.n_layers) return true;    // the last stage hands rows to nobody
                 for (int64_t at = 0; at < T; at += stage_frame_rows) {
                     const int64_t rows = std::min(stage_frame_rows, T - at);
@@ -21720,9 +21776,9 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
-            const bool ok = stage_prefill.run(toks.data(), n, pos0, pe);
-            stage_prefill.on_chunk = nullptr;
-            const auto& ps = stage_prefill.stats();
+            const bool ok = pf.run(toks.data(), n, pos0, pe);
+            pf.on_chunk = nullptr;
+            const auto& ps = pf.stats();
             *experts_out += ps.experts_streamed;
             worker_stats.prefill_chunks += ps.chunks;
             worker_stats.prefill_experts += ps.experts_streamed;
@@ -21736,19 +21792,25 @@ int main(int argc, char** argv) {
         kvg_start(xcache.slots());
         // Filled by both sides of the callback: the transport times and bytes are the ring's, the expert and file
         // counters belong to this stage's engine, which knows its own residency answer.
-        // Between two requests this stage must forget the last document. session_zero covers R, the GDN recurrence,
-        // the QSA cache and the PLE history; the elastic K/V hands its cells back the same way a fresh run starts.
-        // A stage that skipped this would convolve request 2's first rows with request 1's, and the output would
+        // Between two requests this stage must forget the last document, for THAT slot only - session_zero covers
+        // R, the GDN recurrence, the QSA cache and the PLE history of the SessionState it is given; the elastic
+        // K/V hands its cells back the same way a fresh run starts. A stage that skipped this, or zeroed the
+        // wrong slot's session, would convolve one request's first rows with another's, and the output would
         // still look like text.
-        auto reset_stage = [&](std::string& re) -> bool {
+        auto reset_stage = [&](int slot, std::string& re) -> bool {
+            // Always zeroes the shared solo session (`ss`), not slot_sessions[slot]: prefill and the first
+            // decode step always run solo (see prefill_stage/compute_stage) - see this block's declaration
+            // comment on why that is correct, not a shortcut. This slot's OWN buffer is stale until the
+            // next compute_stage call copies fresh state into it, which slot_primed tracks.
             strata::core::session_zero(ss, g, nullptr, main_cs);
             if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
                 re = "stage: session reset did not synchronize"; return false;
             }
             kvg_start(xcache.slots());
+            if ((size_t) slot < slot_primed.size()) slot_primed[(size_t) slot] = false;
             return true;
         };
-        auto compute_stage = [&](const strata::core::BoundaryFrame* input, int32_t token, int64_t pos,
+        auto compute_stage = [&](int slot, const strata::core::BoundaryFrame* input, int32_t token, int64_t pos,
                                 strata::core::BoundaryFrame& output, std::string& re) -> bool {
             if (token < 0 || token >= g.n_vocab) { re = "stage: invalid input token"; return false; }
             if (!kvg_ensure(pos + 64, [] { cudaDeviceSynchronize(); })) { re = "stage: KV capacity failed"; return false; }
@@ -21760,14 +21822,45 @@ int main(int argc, char** argv) {
                     r->elems_per_row != g.hc * g.n_embd || b->elems_per_row != g.n_embd || inj->elems_per_row != g.hc) {
                     re = "stage: invalid boundary tensor shape"; return false;
                 }
+                // stage_hand is one shared scratch buffer, not one per slot: stage_worker_run's main loop is
+                // single-threaded, so at most one compute() call is ever in flight, regardless of which slot
+                // it names - the same reasoning that keeps a single prefill_stage lambda (not one per slot)
+                // safe to share across slots at the lambda level, just not at the Prefill-object level above.
                 std::memcpy(stage_hand, r->host, (size_t)r->floats() * sizeof(float));
                 std::memcpy(stage_hand + g.hc * g.n_embd, b->host, (size_t)b->floats() * sizeof(float));
                 std::memcpy(stage_hand + (g.hc + 1) * g.n_embd, inj->host, (size_t)inj->floats() * sizeof(float));
             }
             drive.d.failed = false; drive.d.layers = 0; drive.d.experts = 0;
             int32_t sampled = -1;
-            if (!stage_ver.run(1, &token, pos, &drive_pool_multi, &drive, &sampled, re) || drive.d.failed) {
-                if (re.empty()) re = "stage: expert worker failed"; return false;
+            const bool primed = (size_t) slot < slot_primed.size() && slot_primed[(size_t) slot];
+            if (!primed) {
+                // First decode step for this slot since its last reset: run solo (same session/path the
+                // prefill just used), then copy the resulting state into the slot's own Metal-window buffer
+                // (exactly --serve's own admission copy, see the solo-Prefill declaration comment above) so
+                // later positions can read it through run_slot_rows. Running run_slot_rows here instead would
+                // read a never-populated slot buffer and silently compute over whatever that buffer happened
+                // to start as - this is the bug an earlier version of this change had, found by running real
+                // decode compute against known-good output, not by review.
+                if (!stage_ver.run(1, &token, pos, &drive_pool_multi, &drive, &sampled, re) || drive.d.failed) {
+                    if (re.empty()) re = "stage: expert worker failed"; return false;
+                }
+                if (!stage_ver.commit(1, re)) return false;
+                if (!strata::metal_engine::window_slot_copy_main(/*into_slot=*/true, slot, pos + 1,
+                                                                 /*kv_only=*/false, re)) {
+                    if (re.empty()) re = "stage: copying solo state into the batch slot failed";
+                    return false;
+                }
+                if ((size_t) slot < slot_primed.size()) slot_primed[(size_t) slot] = true;
+            } else {
+                const int rows[1] = {slot};
+                const int32_t toks1[1] = {token};
+                const int64_t poss[1] = {pos};
+                int32_t outs[1] = {-1};
+                if (!stage_ver.run_slot_rows(rows, 1, toks1, poss, &drive_pool_multi, &drive, outs, re) ||
+                    drive.d.failed) {
+                    if (re.empty()) re = "stage: expert worker failed"; return false;
+                }
+                sampled = outs[0];
             }
             if (o.layer_end < g.n_layers) {
                 if (!stage_ver.boundary_capture(output, 1, pos, main_cs, re)) return false;
@@ -21781,7 +21874,10 @@ int main(int argc, char** argv) {
             }
             *experts_out += drive.d.experts;
             *filebytes_out += (int64_t) (src.file_read_bytes() - stage_fb0);
-            return stage_ver.commit(1, re);
+            // commit_slots only on the primed (run_slot_rows) path - the unprimed path already committed via
+            // commit(1, re) above, on the solo session, before the copy-in; calling commit_slots there too
+            // would commit a batch window that was never run.
+            return primed ? stage_ver.commit_slots(re) : true;
         };
         bool ok = false;
         // The mesh form: this engine links to the daemon's two endpoints, listens on nothing, and knows no
@@ -21794,8 +21890,16 @@ int main(int argc, char** argv) {
         wc.worker_data_endpoint = o.worker_data_endpoint;
         wc.worker_signal_endpoint = o.worker_signal_endpoint;
         wc.instance_id = o.instance_id;
-        wc.batch = o.batch > 0 ? o.batch : 1;
+        wc.batch = n_slots;
         wc.lo = o.layer_begin; wc.hi = o.layer_end;
+        // Tectonic (ADR 0005, entry bridge): only the entry stage (layer_begin == 0) ever translates
+        // gen/delta/done JSON - stage_worker_run refuses any non-BoundaryFrame byte on its data connection
+        // when this is null (see its own comment on c.entry_bridge), which is every stage of a real split
+        // except the entry. Without constructing and attaching one here, --tectonic could never actually
+        // admit a single gen on ANY deployment, single-stage or split - found by running the real binary
+        // end to end, not by code review.
+        strata::core::EntryBridge entry_bridge;
+        if (o.layer_begin == 0) wc.entry_bridge = &entry_bridge;
         ok = strata::program::stage_worker_run(wc, compute_stage, reset_stage, prefill_stage,
                                                &worker_stats, err);
         if (!ok) std::fprintf(stderr, "stage: %s\n", err.c_str());
