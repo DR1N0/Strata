@@ -12,8 +12,10 @@
 #include "strata/core/entry_bridge.hpp"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -25,23 +27,20 @@ namespace strata::program {
 struct StageWorkerConfig {
     std::string worker_data_endpoint;    // Tectonic: was `agent`; the daemon's data connection, HOST:PORT
     // Tectonic: the signal connection (cancel/shutdown) and the hello handshake on both connections are
-    // wired up below, and (wire v4, ADR 0005) this loop's own request bookkeeping below is now keyed by
-    // BoundaryFrame::request_id instead of one shared set of variables - Tier 1 concurrency, meaning more
-    // than one request's frames can be in flight on this connection without corrupting each other. NOT
-    // wired up yet: `Verifier::run_slot_rows` (Tier 2 - real concurrent *compute*, batching several
-    // requests' decode steps into one kernel call). Tier 1 keeps this stage's compute state single-slot
-    // (one session's R/GDN/QSA-cache/PLE-history resident at a time, same as before); the per-request map
-    // below is dispatch/bookkeeping correctness, not a promise that two requests are ever computed at
-    // once. See docs/FORK_LOG.md for the still-open question that blocks Tier 2: whether `gen`'s tokens[]
-    // replaces this loop's per-position BoundaryFrame traffic outright, or only carries the entry stage's
-    // prompt while inter-stage handoff still travels as BoundaryFrame underneath it.
+    // wired up below, and (wire v4, ADR 0005; extended by the ADR 0005 addendum below) this loop's own
+    // request bookkeeping is keyed by BoundaryFrame::request_id, with `batch` independently resident slots
+    // (R/GDN/QSA-cache/PLE-history each): more than one request can be ACTUALLY COMPUTING, interleaved -
+    // one decode step at a time per slot, cycling - not just dispatched without corrupting each other.
+    // This is still not `Verifier::run_slot_rows`' kernel-level BATCHING (Tier 2: several slots' decode
+    // steps combined into one kernel call, S > 1): this loop always calls it (or the equivalent compute
+    // callback) with exactly one active slot per invocation. See docs/FORK_LOG.md's 2026-11-19 section for
+    // why that split is real in the underlying Verifier/BSlot implementation, not assumed.
     std::string worker_signal_endpoint;
     std::string instance_id;
-    // --batch's value, self-reported in hello. Today (Tier 1) this is a protocol-level admission number -
-    // how many requests the caller may let be in flight on the data connection at once without getting
-    // `batch_full` - NOT a promise that `batch` independent sessions' compute state coexist: this stage
-    // still runs one session's state at a time (see the comment above). A caller that actually wants N
-    // independently-stateful concurrent sessions needs Tier 2, not a bigger `batch` number by itself.
+    // --batch's value, self-reported in hello, AND the number of resident slots this loop actually
+    // maintains (slot_state below is sized to it). A caller that wants true kernel-level batched
+    // throughput (Tier 2) still needs separate work - this only interleaves single-slot compute steps,
+    // which is a dispatch/scheduling change, not a GPU kernel-composition one.
     int batch = 1;
     int64_t lo = 0, hi = 0;     // this engine's layer range, and nothing else about its place in the mesh
     // Non-null only for the entry stage (lo == 0) of a single-stage (non-split) deployment - see
@@ -63,21 +62,28 @@ struct StageWorkerStats {
     int64_t prefill_tokens = 0, prefill_chunks = 0, prefill_experts = 0, prefill_resident = 0;
     double prefill_host_ms = 0;
 };
-// `input` is null exactly for a stage that owns the embedding (lo == 0): that stage starts from a token alone.
-using StageWorkerCompute = std::function<bool(const core::BoundaryFrame* input, int32_t token, int64_t pos,
-                                              core::BoundaryFrame& output, std::string& err)>;
-// Called when a position 0 arrives, which is how a new request starts. session_zero covers R, the GDN recurrence,
-// the QSA cache and the PLE history; an engine that skipped this would convolve request 2's rows with request 1's.
-using StageWorkerReset = std::function<bool(std::string&)>;
-// The prompt path. Given the whole prompt it computes every position in chunked batches and hands each chunk over
-// AS IT FINISHES, through `emit`. Emitting per chunk is not an optimisation: a 20K prompt's rows are about a
-// gigabyte, so collecting them into one frame would exceed both the wire's payload bound and any sane receive
-// buffer. This exists because a position-at-a-time prompt is not a design choice either - a real prompt would cost
-// one chain round-trip per token, while chunks make it proportional to chunks.
+// `slot` (ADR 0005 addendum): which of `batch` resident sessions this call reads and writes - the caller
+// (generate.cpp) binds it to that slot's own SessionState (Verifier::init_slots / run_slot_rows with S=1,
+// rows={slot}) before running. Two different `slot` values must never alias the same state; this loop's
+// job is exactly to guarantee that, not the callback's. `input` is null exactly for a stage that owns the
+// embedding (lo == 0): that stage starts from a token alone.
+using StageWorkerCompute = std::function<bool(int slot, const core::BoundaryFrame* input, int32_t token,
+                                              int64_t pos, core::BoundaryFrame& output, std::string& err)>;
+// Called when a position 0 arrives for `slot`, which is how a new request starts there. session_zero covers
+// R, the GDN recurrence, the QSA cache and the PLE history, for THAT slot's SessionState only; an engine
+// that skipped this, or reset the wrong slot, would convolve one request's rows with another's.
+using StageWorkerReset = std::function<bool(int slot, std::string&)>;
+// The prompt path, run against `slot`'s own SessionState/Prefill binding. Given the whole prompt it computes
+// every position in chunked batches and hands each chunk over AS IT FINISHES, through `emit`. Emitting per
+// chunk is not an optimisation: a 20K prompt's rows are about a gigabyte, so collecting them into one frame
+// would exceed both the wire's payload bound and any sane receive buffer. This exists because a
+// position-at-a-time prompt is not a design choice either - a real prompt would cost one chain round-trip
+// per token, while chunks make it proportional to chunks. Prefill calls across different slots are never
+// concurrent in this loop - see docs/FORK_LOG.md's 2026-11-19 section on why that is deliberate, not a gap.
 using StageWorkerEmit = std::function<bool(core::BoundaryFrame&)>;
 // `hand_rows` is null for the entry stage, which owns the embedding; every other stage is handed the prompt's whole
 // row tensor, one row per token, in the same order.
-using StageWorkerPrefill = std::function<bool(const int32_t* tokens, int64_t n, int64_t pos0,
+using StageWorkerPrefill = std::function<bool(int slot, const int32_t* tokens, int64_t n, int64_t pos0,
                                               const float* hand_rows, int64_t hand_elems,
                                               const StageWorkerEmit& emit, std::string& err)>;
 inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerCompute& compute,
@@ -130,45 +136,75 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
     }
     if (!core::control_send_ready(link, err)) return false;
 
-    // Tectonic (wire v4, ADR 0005): per-request state, replacing the single shared set of variables this
-    // loop used back when a connection could only ever carry one request's frames (wire v3 had no
-    // request_id - see boundary_wire.hpp). The prefill accumulation buffers below are touched only by
-    // this, the main, thread - the signal thread never reaches into them, so they need no synchronization
-    // of their own. `cancelled` is an atomic because the signal thread DOES write it; `requests_mu` guards
-    // only the map's own structure (insert/find/erase), which both threads touch. A `PerRequestState&` or
-    // `*` obtained under the lock stays valid without holding it further: `unordered_map` never relocates
-    // an existing element's storage on inserting another or erasing a different key, and this is the only
-    // thread that ever erases.
-    struct PerRequestState {
+    // Tectonic (ADR 0005 addendum, "Tier 1.5"): `batch` independently resident slots, replacing wire v4's
+    // single implicit session. Each slot owns its own prefill accumulation buffers (touched only by this,
+    // the main, thread - the signal thread never reaches into them) and its own cancellation flag (an
+    // atomic, since the signal thread DOES write it). `state_mu` guards only the two maps' own structure
+    // (insert/find/erase) and the `occupied`/assignment bookkeeping, not the buffers themselves. A
+    // `SlotState&`/`*` obtained under the lock stays valid without holding it further: neither container
+    // relocates an existing element's storage on an unrelated insert or erase, and this is the only thread
+    // that ever erases from `request_slot` or flips `occupied` off.
+    struct SlotState {
+        bool occupied = false;
         int64_t pf_n = -1, pf_elems = 0;
         std::vector<float> pf_rows;
         std::vector<int32_t> pf_tokens;
         std::atomic<bool> cancelled{false};
     };
-    std::mutex requests_mu;
-    std::unordered_map<uint64_t, PerRequestState> requests;
+    std::mutex state_mu;
+    std::vector<SlotState> slot_state((size_t) std::max(1, c.batch));
+    std::unordered_map<uint64_t, int> request_slot;   // request_id -> index into slot_state
     // Which request_id the main loop most recently started a position for. Call only while holding
-    // requests_mu. A `cancel` on the signal connection names a Tectonic-level STRING request_id
+    // state_mu. A `cancel` on the signal connection names a Tectonic-level STRING request_id
     // (SignalMessage::request_id) that this loop has no way to resolve to a wire request_id - only the
     // entry stage's gen/delta/done bridge keeps that mapping (entry_bridge.hpp), and teaching every
     // interior stage the same mapping is mesh orchestration work this round does not do (docs/FORK_LOG.md).
-    // So a cancel here can only mean "whichever request I am computing right now" - which is exactly
-    // Tier 1's real constraint anyway (one session's compute state resident at a time, see
-    // StageWorkerConfig::batch's comment), not a regression from the single-shared-bool version this
-    // replaces.
+    // So a cancel here can only mean "whichever request I am computing right now" - true regardless of how
+    // many slots are resident, since this is about which ONE position the signal race lands on.
     uint64_t current_request_id = 0;
     bool have_current = false;
-    // Resets (or creates) one request's bookkeeping to "nothing accumulated, not cancelled". Call only
-    // while holding requests_mu. Field-by-field rather than `requests[id] = PerRequestState{}`: the
-    // atomic `cancelled` member has no copy/move assignment to call.
-    auto reset_request_state = [&](uint64_t rid) -> PerRequestState& {
-        PerRequestState& st = requests[rid];
+    // Looks up request_id's slot, assigning a free one and resetting it ("nothing accumulated, not
+    // cancelled") if this is the first time this request_id has been seen. -1 if new and no slot is free -
+    // a protocol violation by whatever routed this request here (the entry bridge's own admission control,
+    // or - for a non-entry stage - the mesh layer, neither of which this round allows to overrun `batch`
+    // slots; see docs/FORK_LOG.md). Call only while holding state_mu. Field-by-field reset, not
+    // `SlotState{}` assignment: the atomic `cancelled` member has no copy/move assignment to call.
+    auto ensure_slot = [&](uint64_t rid) -> int {
+        auto it = request_slot.find(rid);
+        int idx;
+        if (it != request_slot.end()) {
+            idx = it->second;
+        } else {
+            idx = -1;
+            for (size_t i = 0; i < slot_state.size(); ++i) {
+                if (!slot_state[i].occupied) { idx = (int) i; break; }
+            }
+            if (idx < 0) return -1;
+            slot_state[(size_t) idx].occupied = true;
+            request_slot[rid] = idx;
+        }
+        SlotState& st = slot_state[(size_t) idx];
         st.pf_n = -1;
         st.pf_elems = 0;
         st.pf_rows.clear();
         st.pf_tokens.clear();
         st.cancelled.store(false, std::memory_order_relaxed);
-        return st;
+        return idx;
+    };
+    // Looks up request_id's slot without touching its state - for a frame that continues a request already
+    // in flight (not pos0 == 0, not kBoundaryRequest). -1 if not found: a position for a request this stage
+    // never saw start, a protocol error. Call only while holding state_mu.
+    auto find_slot = [&](uint64_t rid) -> int {
+        auto it = request_slot.find(rid);
+        return it == request_slot.end() ? -1 : it->second;
+    };
+    // Frees request_id's slot for reuse. A no-op if not found (a release racing another, or a request that
+    // was never admitted). Call only while holding state_mu.
+    auto release_slot = [&](uint64_t rid) {
+        auto it = request_slot.find(rid);
+        if (it == request_slot.end()) return;
+        slot_state[(size_t) it->second].occupied = false;
+        request_slot.erase(it);
     };
 
     // Tectonic: shutdown still ends the whole process regardless of how many requests are in flight -
@@ -176,8 +212,8 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
     std::atomic<bool> shutdown_requested{false};
     std::thread signal_thread;
     if (have_signal) {
-        signal_thread = std::thread([&signal_link, &shutdown_requested, &link, &requests_mu, &requests,
-                                     &current_request_id, &have_current]() {
+        signal_thread = std::thread([&signal_link, &shutdown_requested, &link, &state_mu, &request_slot,
+                                     &slot_state, &current_request_id, &have_current]() {
             for (;;) {
                 core::SignalMessage msg;
                 std::string serr;
@@ -187,14 +223,15 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                     return;
                 }
                 if (msg.kind == core::SignalMessage::Kind::kCancel) {
-                    std::lock_guard<std::mutex> lock(requests_mu);
+                    std::lock_guard<std::mutex> lock(state_mu);
                     if (have_current) {
-                        auto it = requests.find(current_request_id);
-                        if (it != requests.end()) it->second.cancelled.store(true, std::memory_order_relaxed);
+                        auto it = request_slot.find(current_request_id);
+                        if (it != request_slot.end())
+                            slot_state[(size_t) it->second].cancelled.store(true, std::memory_order_relaxed);
                     }
                 } else if (msg.kind == core::SignalMessage::Kind::kShutdown) {
                     shutdown_requested.store(true, std::memory_order_relaxed);
-                    link.close();   // unblocks the main loop's receive()
+                    link.close();   // unblocks the reader thread's blocking recv_frame
                     return;
                 }
             }
@@ -219,158 +256,192 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         }
         return true;
     };
-    auto receive = [&](BoundaryFrame& f) {
-        std::vector<uint8_t> bytes;
-        const auto t0 = std::chrono::steady_clock::now();
-        if (!link.recv_frame(bytes, err, size_t(256) << 20)) return false;
-        if (stats) {
-            stats->net_recv_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            stats->net_in_bytes += (int64_t) bytes.size();
-        }
-        return boundary_deserialize(bytes.data(), bytes.size(), f, err);
-    };
 
-    // A stage with an upstream cannot act on one chunk frame: its prompt path needs EVERY row before it runs,
-    // because those rows are one tensor in token order. So the upstream stage first sends the prompt itself (a
-    // header frame carrying all its tokens), then the chunk frames; this side accumulates until it has them all.
-    // An entry stage does the opposite: it receives the prompt and EMITS chunk frames as its prompt path runs.
-    // (Tectonic, wire v4: this accumulation state now lives in `requests[in.request_id]`, not in variables
-    // shared by every request on the connection - see the per-request state block above.)
-    //
-    // Tectonic (entry bridge, Tier 1, ADR 0005): frames this loop synthesizes for itself, consumed before
-    // the socket is asked for more - the entry bridge's `gen` turns into a kBoundaryPrompt-shaped `in`
-    // below, and a sampled token not yet at max_new turns into the next position's `in` (see the
-    // per-position branch's tail). A plain std::vector, not a queue class: this never holds more than one
-    // entry under Tier 1's single-resident-session constraint.
-    std::vector<BoundaryFrame> pending;
-    for (;;) {
-        BoundaryFrame in;
-        if (!pending.empty()) {
-            in = std::move(pending.front());
-            pending.erase(pending.begin());
-        } else if (c.entry_bridge != nullptr) {
-            // The entry stage's connection carries two shapes of frame now: BoundaryFrame bytes (to and
-            // from this stage's own neighbours, exactly as before) and JSON gen/delta/done/error (to and
-            // from this stage's own local daemon) - see control_wire.hpp's "RESOLVED" comment. Both share
-            // the same u32-length-prefixed framing, so reading the raw bytes once and peeking the shape is
-            // enough to tell them apart without a second framing primitive.
+    // Tectonic (ADR 0005 addendum): `link` is now read by its OWN thread, decoupled from the main loop's
+    // compute/dispatch. Without this, admitting a new request while another is already resident would be
+    // impossible: the old design only ever read the socket when it had nothing else to do, so a slot's own
+    // decode-continuation frames (self-fed or arriving from a neighbour) always starved out a waiting `gen`
+    // until that slot's request fully finished (see docs/FORK_LOG.md's 2026-11-19 section for how this was
+    // found - the same way the Tier 1 round found the current_request_id bug, by writing the test first).
+    // `BoundarySocket::send`/`recv` touch no shared mutable state beyond the OS file descriptor itself (the
+    // same reasoning the signal connection's own independent thread already relies on), so a reader thread
+    // here and `send` above on the main thread are safe together.
+    std::mutex incoming_mu;
+    std::condition_variable incoming_cv;
+    std::deque<std::vector<uint8_t>> incoming;
+    bool reader_done = false;
+    std::string reader_err;
+    std::thread reader_thread([&] {
+        for (;;) {
             std::vector<uint8_t> bytes;
             const auto t0 = std::chrono::steady_clock::now();
-            if (!link.recv_frame(bytes, err, size_t(256) << 20)) {
-                if (shutdown_requested.load(std::memory_order_relaxed)) {
-                    err.clear();
-                    return true;
-                }
-                return false;
+            if (!link.recv_frame(bytes, reader_err, size_t(256) << 20)) {
+                std::lock_guard<std::mutex> lock(incoming_mu);
+                reader_done = true;
+                incoming_cv.notify_all();
+                return;
             }
             if (stats) {
                 stats->net_recv_ms +=
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 stats->net_in_bytes += (int64_t) bytes.size();
             }
-            if (looks_like_boundary_frame(bytes)) {
-                if (!boundary_deserialize(bytes.data(), bytes.size(), in, err)) return false;
-            } else {
-                GenFields gf;
-                std::string type;
-                if (!control_parse_gen(bytes, gf, type, err)) return false;
-                if (gf.tokens.empty()) {
-                    if (!control_send_error(link, gf.request_id, "invalid_request", "gen with no tokens", err))
-                        return false;
-                    continue;
-                }
-                uint64_t wire_id = 0;
-                // Tier 1: effectively one request's compute state resident at a time (see
-                // StageWorkerConfig::batch's comment) - 1 is deliberate, not a stand-in for "whatever
-                // --batch reports", until Tier 2 gives independent per-request compute state.
-                if (!c.entry_bridge->admit(gf.request_id, gf.max_new, /*max_in_flight=*/1, wire_id)) {
-                    if (!control_send_error(link, gf.request_id, "batch_full",
-                                            "this engine is already serving a request", err)) return false;
-                    continue;
-                }
-                // Tectonic: "the token loop starts at the last prompt position, whose prediction is the
-                // first generated token" (generate.cpp's own plan v0.3 P5 comment) - the entry stage's
-                // non-bridged path already relies on this split, so the bridge has to reproduce it rather
-                // than hand every prompt token to prefill() as one span. Not kBoundaryRequest for the
-                // prefill-shaped part: that kind means "an upstream is about to hand me tensor chunks", a
-                // non-entry stage's protocol - the entry stage owns the embedding and calls prefill()
-                // directly from token ids, the same shape a real multi-row prompt frame already uses.
-                //
-                // The split is pushed onto `pending` and NOT also assigned to `in` here: every synthesized
-                // frame goes through the exact same top-of-loop path a frame read off the wire would,
-                // which is what keeps this one `pending` mechanism correct for both "gen produced a frame"
-                // and "a decode step produced the next one" (see the per-position branch's tail) without
-                // two copies of the same bookkeeping.
-                const size_t n = gf.tokens.size();
-                const int64_t last_token = gf.tokens.back();
-                if (n > 2) {
-                    BoundaryFrame prompt_part;
-                    prompt_part.kind = kBoundaryPrompt;
-                    prompt_part.request_id = wire_id;
-                    prompt_part.pos0 = 0;
-                    prompt_part.rows = (int64_t) (n - 1);
-                    prompt_part.next_token.assign(gf.tokens.begin(), gf.tokens.end() - 1);
-                    pending.push_back(std::move(prompt_part));
-                } else if (n == 2) {
-                    // Too short for the chunked prefill path (it requires rows > 1): run position 0 through
-                    // the generic per-position path instead, same as a real one-token prompt would, just
-                    // not reported as a delta (kBoundaryPrompt, not kBoundaryRows - see the per-position
-                    // branch's delta-emission check).
-                    BoundaryFrame prompt_part;
-                    prompt_part.kind = kBoundaryPrompt;
-                    prompt_part.request_id = wire_id;
-                    prompt_part.pos0 = 0;
-                    prompt_part.rows = 1;
-                    prompt_part.next_token.assign(1, gf.tokens[0]);
-                    pending.push_back(std::move(prompt_part));
-                }
-                // The last prompt token is tagged kBoundaryRows, not kBoundaryPrompt: positionally it is
-                // still part of the prompt, but its OUTPUT is the first token the client sees, so it must
-                // take the decode (delta-worthy) path, not the silent-prefill one. (n == 1: this is the
-                // only frame, at pos0 0, which is exactly a one-token prompt's existing behaviour.)
-                BoundaryFrame first_decode;
-                first_decode.kind = kBoundaryRows;
-                first_decode.request_id = wire_id;
-                first_decode.pos0 = (int64_t) (n - 1);
-                first_decode.rows = 1;
-                first_decode.next_token.assign(1, (int32_t) last_token);
-                pending.push_back(std::move(first_decode));
-                // `in` is untouched on purpose (see the comment above): go round once more so the
-                // top-of-loop `pending` check is what fills it in, instead of a second, divergent copy of
-                // that logic here.
-                continue;
+            {
+                std::lock_guard<std::mutex> lock(incoming_mu);
+                incoming.push_back(std::move(bytes));
             }
-        } else if (!receive(in)) {
-            // A shutdown closes `link` itself to unblock this call, so a shutdown-caused failure is the
-            // expected way this function ends, not a transport error worth reporting as one.
-            if (shutdown_requested.load(std::memory_order_relaxed)) {
-                err.clear();
-                return true;
+            incoming_cv.notify_one();
+        }
+    });
+    struct ReaderJoinGuard {
+        std::thread* t;
+        ~ReaderJoinGuard() { if (t && t->joinable()) t->join(); }
+    } reader_join_guard{&reader_thread};
+
+    // A stage with an upstream cannot act on one chunk frame: its prompt path needs EVERY row before it runs,
+    // because those rows are one tensor in token order. So the upstream stage first sends the prompt itself (a
+    // header frame carrying all its tokens), then the chunk frames; this side accumulates until it has them all.
+    // An entry stage does the opposite: it receives the prompt and EMITS chunk frames as its prompt path runs.
+    // (Tectonic, wire v4: this accumulation state lives per-slot in `slot_state`, not in variables shared by
+    // every request on the connection.)
+    //
+    // Tectonic (entry bridge + ADR 0005 addendum, "Tier 1.5"): frames this loop synthesizes for itself - the
+    // entry bridge's `gen` turns into one or two kBoundaryPrompt/kBoundaryRows-shaped `in`s, and a sampled
+    // token not yet at max_new turns into the next position's `in` (see the per-position branch's tail) -
+    // are queued in `pending` and consumed before falling back to the socket's own queue (`incoming`,
+    // filled by the reader thread above). Checking `incoming` FIRST, every iteration, rather than draining
+    // `pending` to empty first, is what makes admitting a new request possible while another slot is mid
+    // self-feed: the old (Tier 1) order starved new admissions behind an already-resident slot's decode
+    // loop for as long as that slot stayed busy - found by writing this round's test, not predicted
+    // (docs/FORK_LOG.md's 2026-11-19 section).
+    std::vector<BoundaryFrame> pending;
+    for (;;) {
+        BoundaryFrame in;
+        bool have_in = false;
+
+        {
+            std::unique_lock<std::mutex> lock(incoming_mu);
+            if (!incoming.empty()) {
+                std::vector<uint8_t> bytes = std::move(incoming.front());
+                incoming.pop_front();
+                lock.unlock();
+                if (looks_like_boundary_frame(bytes)) {
+                    if (!boundary_deserialize(bytes.data(), bytes.size(), in, err)) return false;
+                    have_in = true;
+                } else if (c.entry_bridge == nullptr) {
+                    err = "worker: non-bridged stage received a non-BoundaryFrame message";
+                    return false;
+                } else {
+                    GenFields gf;
+                    std::string type;
+                    if (!control_parse_gen(bytes, gf, type, err)) return false;
+                    if (gf.tokens.empty()) {
+                        if (!control_send_error(link, gf.request_id, "invalid_request", "gen with no tokens", err))
+                            return false;
+                    } else {
+                        uint64_t wire_id = 0;
+                        if (!c.entry_bridge->admit(gf.request_id, gf.max_new, (size_t) std::max(1, c.batch),
+                                                   wire_id)) {
+                            if (!control_send_error(link, gf.request_id, "batch_full", "no free slot for a new request",
+                                                    err)) return false;
+                        } else {
+                            // Tectonic: "the token loop starts at the last prompt position, whose prediction
+                            // is the first generated token" (generate.cpp's own plan v0.3 P5 comment) - the
+                            // entry stage's non-bridged path already relies on this split, so the bridge has
+                            // to reproduce it rather than hand every prompt token to prefill() as one span.
+                            // Not kBoundaryRequest for the prefill-shaped part: that kind means "an upstream
+                            // is about to hand me tensor chunks", a non-entry stage's protocol - the entry
+                            // stage owns the embedding and calls prefill() directly from token ids, the same
+                            // shape a real multi-row prompt frame already uses.
+                            const size_t n = gf.tokens.size();
+                            const int64_t last_token = gf.tokens.back();
+                            if (n > 2) {
+                                BoundaryFrame prompt_part;
+                                prompt_part.kind = kBoundaryPrompt;
+                                prompt_part.request_id = wire_id;
+                                prompt_part.pos0 = 0;
+                                prompt_part.rows = (int64_t) (n - 1);
+                                prompt_part.next_token.assign(gf.tokens.begin(), gf.tokens.end() - 1);
+                                pending.push_back(std::move(prompt_part));
+                            } else if (n == 2) {
+                                // Too short for the chunked prefill path (it requires rows > 1): run position
+                                // 0 through the generic per-position path instead, same as a real one-token
+                                // prompt would, just not reported as a delta (kBoundaryPrompt, not
+                                // kBoundaryRows - see the per-position branch's delta-emission check).
+                                BoundaryFrame prompt_part;
+                                prompt_part.kind = kBoundaryPrompt;
+                                prompt_part.request_id = wire_id;
+                                prompt_part.pos0 = 0;
+                                prompt_part.rows = 1;
+                                prompt_part.next_token.assign(1, gf.tokens[0]);
+                                pending.push_back(std::move(prompt_part));
+                            }
+                            // The last prompt token is tagged kBoundaryRows, not kBoundaryPrompt: positionally
+                            // it is still part of the prompt, but its OUTPUT is the first token the client
+                            // sees, so it must take the decode (delta-worthy) path. (n == 1: this is the only
+                            // frame, at pos0 0, exactly a one-token prompt's existing behaviour.)
+                            BoundaryFrame first_decode;
+                            first_decode.kind = kBoundaryRows;
+                            first_decode.request_id = wire_id;
+                            first_decode.pos0 = (int64_t) (n - 1);
+                            first_decode.rows = 1;
+                            first_decode.next_token.assign(1, (int32_t) last_token);
+                            pending.push_back(std::move(first_decode));
+                        }
+                    }
+                }
             }
-            return false;
+        }
+
+        if (!have_in && !pending.empty()) {
+            in = std::move(pending.front());
+            pending.erase(pending.begin());
+            have_in = true;
+        }
+
+        if (!have_in) {
+            std::unique_lock<std::mutex> lock(incoming_mu);
+            incoming_cv.wait(lock, [&] { return !incoming.empty() || reader_done; });
+            if (incoming.empty() && reader_done) {
+                // A shutdown closes `link` itself to unblock the reader thread's recv_frame, so a
+                // shutdown-caused close is the expected way this function ends, not a transport error.
+                lock.unlock();
+                if (shutdown_requested.load(std::memory_order_relaxed)) {
+                    err.clear();
+                    return true;
+                }
+                err = reader_err.empty() ? "worker: data connection closed" : reader_err;
+                return false;
+            }
+            continue;   // something is in `incoming` now - the opportunistic check above picks it up
         }
         if (prefill && in.kind == kBoundaryRequest) {
+            int slot = -1;
             {
-                std::lock_guard<std::mutex> lock(requests_mu);
-                PerRequestState& st = reset_request_state(in.request_id);
-                st.pf_tokens.assign(in.next_token.begin(), in.next_token.end());
-                st.pf_n = in.rows;
-                current_request_id = in.request_id;
-                have_current = true;
+                std::lock_guard<std::mutex> lock(state_mu);
+                slot = ensure_slot(in.request_id);
+                if (slot >= 0) {
+                    SlotState& st = slot_state[(size_t) slot];
+                    st.pf_tokens.assign(in.next_token.begin(), in.next_token.end());
+                    st.pf_n = in.rows;
+                    current_request_id = in.request_id;
+                    have_current = true;
+                }
             }
+            if (slot < 0) { err = "worker: no free slot for a new request (kBoundaryRequest)"; return false; }
             if (stats) ++stats->requests;
-            if (reset && !reset(err)) return false;
+            if (reset && !reset(slot, err)) return false;
             continue;
         }
         if (prefill && in.kind == kBoundaryPrompt && in.rows > 1) {
             // Only this (single) thread ever inserts or erases by key, so taking the lock just for the
             // find and releasing it before prefill() - which can run for a while - is correct: nothing
             // else can erase this entry while it is in use below.
-            PerRequestState* st = nullptr;
+            SlotState* st = nullptr;
             {
-                std::lock_guard<std::mutex> lock(requests_mu);
-                auto it = requests.find(in.request_id);
-                if (it != requests.end() && it->second.pf_n >= 0) st = &it->second;
+                std::lock_guard<std::mutex> lock(state_mu);
+                const int slot = find_slot(in.request_id);
+                if (slot >= 0 && slot_state[(size_t) slot].pf_n >= 0) st = &slot_state[(size_t) slot];
             }
             if (st != nullptr) {
                 const BoundaryTensor* r = in.find("R");
@@ -381,19 +452,26 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 st->pf_rows.insert(st->pf_rows.end(), r->host, r->host + r->floats());
                 if (stats) { stats->positions += r->rows; stats->prompt_positions += r->rows; }
                 if ((int64_t) st->pf_rows.size() / st->pf_elems < st->pf_n) continue;
+                int slot = -1;
+                {
+                    std::lock_guard<std::mutex> lock(state_mu);
+                    slot = find_slot(in.request_id);
+                }
+                if (slot < 0) { err = "worker: slot vanished mid-accumulation"; return false; }
                 const auto t0 = std::chrono::steady_clock::now();
                 const StageWorkerEmit no_emit = [](BoundaryFrame&) { return true; };
-                const bool ok = prefill(st->pf_tokens.data(), st->pf_n, 0, st->pf_rows.data(), st->pf_elems, no_emit, err);
+                const bool ok =
+                    prefill(slot, st->pf_tokens.data(), st->pf_n, 0, st->pf_rows.data(), st->pf_elems, no_emit, err);
                 if (stats) {
                     stats->prefill_ms +=
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                     stats->prefill_tokens += st->pf_n;
                 }
                 {
-                    // Accumulation for this request is done either way - but the entry (and its cancel
-                    // flag) stays alive: the decode positions that follow under the same request_id still
-                    // need it, which is why this clears the fields rather than erasing the key.
-                    std::lock_guard<std::mutex> lock(requests_mu);
+                    // Accumulation for this request is done either way - but the slot (and its cancel flag)
+                    // stays resident: the decode positions that follow under the same request_id still need
+                    // it, which is why this clears the fields rather than releasing the slot.
+                    std::lock_guard<std::mutex> lock(state_mu);
                     st->pf_n = -1; st->pf_rows.clear(); st->pf_elems = 0;
                 }
                 if (!ok) return false;
@@ -411,16 +489,24 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         }
         // A prompt frame carries the whole prompt, so the chunking is the engine's rather than the wire's.
         if (prefill && in.kind == kBoundaryPrompt && in.rows > 1) {
+            int slot = -1;
             if (in.pos0 == 0) {
                 {
-                    std::lock_guard<std::mutex> lock(requests_mu);
-                    reset_request_state(in.request_id);
-                    current_request_id = in.request_id;
-                    have_current = true;
+                    std::lock_guard<std::mutex> lock(state_mu);
+                    slot = ensure_slot(in.request_id);
+                    if (slot >= 0) {
+                        current_request_id = in.request_id;
+                        have_current = true;
+                    }
                 }
+                if (slot < 0) { err = "worker: no free slot for a new request (whole-prompt)"; return false; }
                 if (stats) ++stats->requests;
-                if (reset && !reset(err)) return false;
+                if (reset && !reset(slot, err)) return false;
+            } else {
+                std::lock_guard<std::mutex> lock(state_mu);
+                slot = find_slot(in.request_id);
             }
+            if (slot < 0) { err = "worker: a prompt frame continues a request this stage never started"; return false; }
             auto emit = [&](BoundaryFrame& f) {
                 f.kind = kBoundaryPrompt;          // the same prompt rows, chunk by chunk
                 f.request_id = in.request_id;
@@ -429,7 +515,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 return send(f);
             };
             const auto t_prefill = std::chrono::steady_clock::now();
-            if (!prefill(in.next_token.data(), in.rows, in.pos0, nullptr, 0, emit, err)) return false;
+            if (!prefill(slot, in.next_token.data(), in.rows, in.pos0, nullptr, 0, emit, err)) return false;
             if (stats) {
                 stats->positions += in.rows;
                 stats->prompt_positions += in.rows;
@@ -442,8 +528,8 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         if (in.kind == kBoundaryEnd) {
             // END closes one request, not the engine: a resident stage serves the next request without reloading.
             {
-                std::lock_guard<std::mutex> lock(requests_mu);
-                requests.erase(in.request_id);
+                std::lock_guard<std::mutex> lock(state_mu);
+                release_slot(in.request_id);
             }
             if (stats) {
                 std::fprintf(stderr,
@@ -462,15 +548,19 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
             continue;
         }
         if (in.rows != 1) { err = "worker: one position per frame"; return false; }
+        int slot = -1;
         if (in.pos0 == 0) {                       // position 0 is where a request begins
             {
-                std::lock_guard<std::mutex> lock(requests_mu);
-                reset_request_state(in.request_id);
-                current_request_id = in.request_id;
-                have_current = true;
+                std::lock_guard<std::mutex> lock(state_mu);
+                slot = ensure_slot(in.request_id);
+                if (slot >= 0) {
+                    current_request_id = in.request_id;
+                    have_current = true;
+                }
             }
+            if (slot < 0) { err = "worker: no free slot for a new request (position 0)"; return false; }
             if (stats) ++stats->requests;
-            if (reset && !reset(err)) return false;
+            if (reset && !reset(slot, err)) return false;
         }
         // Tectonic: the cancellation checkpoint, at the same granularity as --serve's sl.stop (after every
         // produced token, not once per batch - see docs/FORK_LOG.md). Per-request_id now (wire v4), but see
@@ -482,12 +572,13 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         // v4), a later request's non-zero positions must not leave an earlier request looking "current".
         bool was_cancelled = false;
         {
-            std::lock_guard<std::mutex> lock(requests_mu);
+            std::lock_guard<std::mutex> lock(state_mu);
             current_request_id = in.request_id;
             have_current = true;
-            auto it = requests.find(in.request_id);
-            if (it != requests.end()) was_cancelled = it->second.cancelled.exchange(false, std::memory_order_relaxed);
+            if (slot < 0) slot = find_slot(in.request_id);
+            if (slot >= 0) was_cancelled = slot_state[(size_t) slot].cancelled.exchange(false, std::memory_order_relaxed);
         }
+        if (slot < 0) { err = "worker: a position continues a request this stage never started"; return false; }
         if (was_cancelled) {
             // The entry bridge gets the real answer here (JSON `error{code:"cancelled"}`, the contract's
             // actual shape) instead of the known wire-level gap below: it knows which request_ids are its
@@ -516,14 +607,14 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 std::fprintf(stderr, "worker: cancelled request %llu at position %lld\n",
                              (unsigned long long) in.request_id, (long long) in.pos0);
             }
-            std::lock_guard<std::mutex> lock(requests_mu);
-            requests.erase(in.request_id);
+            std::lock_guard<std::mutex> lock(state_mu);
+            release_slot(in.request_id);
             continue;
         }
         const int32_t token = in.next_token.empty() ? -1 : in.next_token[0];
         const auto t0 = std::chrono::steady_clock::now();
         BoundaryFrame out;
-        if (!compute(c.lo > 0 ? &in : nullptr, token, in.pos0, out, err)) return false;
+        if (!compute(slot, c.lo > 0 ? &in : nullptr, token, in.pos0, out, err)) return false;
         if (stats) {
             stats->compute_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             ++stats->positions;
@@ -562,8 +653,8 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
             if (!more) {
                 if (!control_send_done(link, tectonic_id, tokens_so_far, err)) return false;
                 c.entry_bridge->release(in.request_id);
-                std::lock_guard<std::mutex> lock(requests_mu);
-                requests.erase(in.request_id);
+                std::lock_guard<std::mutex> lock(state_mu);
+                release_slot(in.request_id);
                 continue;
             }
             // Feed the sampled token back as the next position's input - the old Python daemon prototype's

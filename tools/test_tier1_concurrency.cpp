@@ -20,15 +20,23 @@
 // Section C: EntryBridge::admit's capacity limit, directly - section B's integration never drives this
 // branch (see its comment on why), so this is what actually exercises "a request over capacity is
 // refused", with no socket in the way to obscure whether the check itself is correct.
+// Section D: a REAL two-stage chain (two independent stage_worker_run instances, two real request_ids,
+// each with its own resident slot at each stage), with an artificial "network transit" delay standing in
+// for a real inter-machine hop. Proves ACTUAL temporal overlap - stage A computing request 2's position
+// while request 1's frame is sitting in the (simulated) transit delay elsewhere - with timestamps, not
+// just eventual correctness (which sections A-C already cover).
 #include "stage_worker.hpp"
 #include "strata/core/control_wire.hpp"
 #include "strata/core/entry_bridge.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <nlohmann/json.hpp>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace strata::core;
@@ -95,17 +103,21 @@ void section_a() {
     cfg.instance_id = "test-a";
     cfg.lo = 0;
     cfg.hi = 1;   // irrelevant to the fake compute below, just has to be consistent
+    // 2 resident slots: this section runs requests 100 and 200 concurrently, each needing its own slot
+    // (ADR 0005 addendum) - leaving this at the default of 1 would make ensure_slot() refuse the second
+    // request outright (no free slot), which is exactly what happened the first time this test ran.
+    cfg.batch = 2;
 
     // Fake compute: deterministic, no tensors (behaves like an exit-owning stage so the generic per-position
     // path is exercised without needing prefill's chunk machinery). output token = input token + 1.
     std::atomic<int> reset_calls{0};
-    StageWorkerCompute compute = [](const BoundaryFrame*, int32_t token, int64_t, BoundaryFrame& out,
+    StageWorkerCompute compute = [](int, const BoundaryFrame*, int32_t token, int64_t, BoundaryFrame& out,
                                     std::string&) {
         out.next_token.assign(1, token + 1);
         out.n_tensors = 0;
         return true;
     };
-    StageWorkerReset reset = [&reset_calls](std::string&) { ++reset_calls; return true; };
+    StageWorkerReset reset = [&reset_calls](int, std::string&) { ++reset_calls; return true; };
     StageWorkerPrefill prefill = nullptr;   // not exercised in section A; section B exercises it
 
     std::string worker_err;
@@ -232,15 +244,15 @@ void section_b() {
     // stage_worker.hpp) with no real network or compute delay in between, so a cancellation test needs
     // SOME per-position cost or the decode loop finishes before a signal sent from another thread has any
     // chance to land. A real engine has real compute time here; this fake needs to simulate having it.
-    StageWorkerCompute compute = [](const BoundaryFrame*, int32_t token, int64_t, BoundaryFrame& out,
+    StageWorkerCompute compute = [](int, const BoundaryFrame*, int32_t token, int64_t, BoundaryFrame& out,
                                     std::string&) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         out.next_token.assign(1, token + 1);   // same deterministic transform as section A
         out.n_tensors = 0;
         return true;
     };
-    StageWorkerReset reset = [](std::string&) { return true; };
-    StageWorkerPrefill prefill = [&](const int32_t* tokens, int64_t n, int64_t, const float*, int64_t,
+    StageWorkerReset reset = [](int, std::string&) { return true; };
+    StageWorkerPrefill prefill = [&](int, const int32_t* tokens, int64_t n, int64_t, const float*, int64_t,
                                      const StageWorkerEmit&, std::string&) {
         std::string s;
         for (int64_t i = 0; i < n; ++i) s += std::to_string(tokens[i]) + ",";
@@ -275,8 +287,12 @@ void section_b() {
     // A 4-token prompt (tokens 1,2,3,4) with max_new=2: prefill must get exactly the first 3 tokens
     // (n - 1), and the first delta must be token 4 + 1 = 5 (the last prompt position's prediction), per
     // the split documented in stage_worker.hpp's gen-handling.
+    // max_new is 5, not 2: the busy-rejection check below needs a real wall-clock window (several more
+    // 20ms positions) between req-A's first delta and its done for gen2's bytes to reliably reach
+    // `incoming` before req-A's slot frees up - with too few positions this is a genuine, found-not-assumed
+    // race (see that check's comment).
     json gen1;
-    gen1["type"] = "gen"; gen1["request_id"] = "req-A"; gen1["tokens"] = {1, 2, 3, 4}; gen1["max_new"] = 2;
+    gen1["type"] = "gen"; gen1["request_id"] = "req-A"; gen1["tokens"] = {1, 2, 3, 4}; gen1["max_new"] = 5;
     send_json(data_conn, gen1);
 
     json delta1 = recv_json();
@@ -285,24 +301,20 @@ void section_b() {
          "B: first delta is token 5 (last prompt token 4, + 1)");
     check(prefill_calls.size() == 1 && prefill_calls[0] == "1,2,3,", "B: prefill() got exactly the first n-1 tokens");
 
-    // Sent now, while req-A is still mid-flight (one more position still to go before max_new=2).
+    // Sent now, while req-A is still mid-flight (one more position still to go before max_new=2), with
+    // `cfg.batch` left at its default of 1 - so there is no free slot for req-B yet. Earlier (Tier 1) this
+    // would have sat unread in the TCP buffer until req-A finished, because the loop only read the socket
+    // once its self-feed chain (`pending`) was empty - a `gen` sent while busy was queued, never actually
+    // rejected. The ADR 0005 addendum's opportunistic incoming-check (every iteration, before draining
+    // `pending`) fixes exactly this: a `gen` over capacity now gets a LIVE `error{code:batch_full}` before
+    // req-A's slot is freed - but EXACTLY where that error lands relative to req-A's own remaining delta is
+    // a genuine race (whether the reader thread has drained gen2's bytes into `incoming` by the time the
+    // main loop checks it, vs. req-A's already-queued `pending` continuation) - so this collects messages
+    // until req-A's `done` instead of asserting one fixed order.
     json gen2;
     gen2["type"] = "gen"; gen2["request_id"] = "req-B"; gen2["tokens"] = {9}; gen2["max_new"] = 1;
     send_json(data_conn, gen2);
 
-    // DISCOVERED DURING THIS TEST, REPORTED RATHER THAN PAPERED OVER: a `gen` sent while another is still
-    // in flight does NOT race a live `batch_full` rejection through the socket. The self-feeding decode
-    // loop (stage_worker.hpp: a sampled token not at max_new is pushed onto `pending` and consumed before
-    // the socket is read again) means the loop never polls the socket again until the in-flight request's
-    // `pending` queue is fully drained - which only happens once that request reaches max_new or is
-    // cancelled. A second `gen` sent now simply waits in the TCP receive buffer and is read (and freshly
-    // admitted) only after req-A has already finished and released its slot - it is never seen while
-    // EntryBridge::admit's capacity count is actually at its limit. So this is sequential queuing, not
-    // "rejected while busy": `admit()`'s capacity check is real (see the standalone check of it below,
-    // with no socket in the way) but this integration never drives it to the rejecting branch. A caller
-    // that wants a live `batch_full` on a busy connection needs the loop to poll the socket between
-    // positions too, not just drain `pending` - out of scope for this round, flagged here instead of
-    // silently claimed as working.
     const auto done_tokens_check = [&](const json& done, const char* expect_id, std::vector<int> expect) {
         check(done.value("type", "") == "done" && done.value("request_id", "") == expect_id,
              std::string("B: done for ") + expect_id);
@@ -310,20 +322,31 @@ void section_b() {
         check(got == expect, std::string("B: ") + expect_id + " done.tokens matches");
     };
 
-    // The first request's second (and final, max_new=2) token, then done.
-    json delta2 = recv_json();
-    check(delta2.value("type", "") == "delta" && delta2.value("token", -1) == 6, "B: second delta is token 6");
-    json done1 = recv_json();
-    done_tokens_check(done1, "req-A", {5, 6});
+    int req_a_deltas = 0;
+    bool saw_busy = false;
+    json done1;
+    for (;;) {
+        json msg = recv_json();
+        const std::string type = msg.value("type", "");
+        if (type == "delta" && msg.value("request_id", "") == "req-A") { ++req_a_deltas; continue; }
+        if (type == "error" && msg.value("code", "") == "batch_full") { saw_busy = true; continue; }
+        if (type == "done") { done1 = msg; break; }
+        check(false, "B: unexpected message while waiting for req-A's done: " + msg.dump());
+        break;
+    }
+    check(req_a_deltas == 4, "B: saw req-A's remaining 4 deltas (tokens 6,7,8,9) before its done");
+    check(saw_busy, "B: saw req-B's LIVE error{code:batch_full} before req-A's slot freed - not queued");
+    done_tokens_check(done1, "req-A", {5, 6, 7, 8, 9});
 
-    // Sent while req-A was still mid-flight (see the comment above), req-B's `gen` was sitting in the TCP
-    // buffer the whole time and is only read now, AFTER req-A's slot was released - so it is freshly
-    // admitted, not rejected. Draining it (and its one delta) before req-C is what the comment above means
-    // by "sequential queuing, not rejection".
+    // Now that req-A is finished and its slot is free, a RETRY of the same request is admitted normally.
+    json gen2_retry;
+    gen2_retry["type"] = "gen"; gen2_retry["request_id"] = "req-B"; gen2_retry["tokens"] = {9};
+    gen2_retry["max_new"] = 1;
+    send_json(data_conn, gen2_retry);
     json delta_b = recv_json();
     check(delta_b.value("type", "") == "delta" && delta_b.value("request_id", "") == "req-B" &&
          delta_b.value("token", -1) == 10,
-         "B: req-B (queued during req-A, admitted after it freed up) -> delta 10");
+         "B: req-B retried after req-A freed the slot -> admitted, delta 10");
     json done_b = recv_json();
     done_tokens_check(done_b, "req-B", {10});
 
@@ -387,14 +410,250 @@ void section_c() {
     check(bridge.resolve(id2, resolved) && resolved == "req-Y", "C: resolve() finds the newly admitted request");
     check(!bridge.resolve(id1, resolved), "C: resolve() correctly fails for a released id");
 
-    // Capacity above 1 (not reachable through stage_worker.hpp today - see StageWorkerConfig::batch's
-    // comment - but the class itself does not hard-code 1, so this proves the limit is the CALLER's
-    // choice, not baked into EntryBridge).
+    // Capacity above 1 - section B leaves cfg.batch at its default of 1; a bridge is always given
+    // whatever `batch` the caller configures (see stage_worker.hpp's admit() call site), so this proves
+    // the limit is the CALLER's choice, not baked into EntryBridge.
     EntryBridge bridge2;
     uint64_t a = 0, b = 0, c3 = 0;
     check(bridge2.admit("p", 5, /*max_in_flight=*/2, a), "C: capacity 2, first admit ok");
     check(bridge2.admit("q", 5, /*max_in_flight=*/2, b), "C: capacity 2, second admit ok");
     check(!bridge2.admit("r", 5, /*max_in_flight=*/2, c3), "C: capacity 2, third admit refused");
+}
+
+// ---- Section D: a real two-stage chain, timing-based proof of actual overlap ------------------------
+//
+// Two real stage_worker_run instances (stage A, layers [0,1); stage B, layers [1,2)), each with 2
+// resident slots. Two driver threads (one per request) each run their own request through BOTH stages,
+// round-trip after round-trip, inserting an artificial "transit" sleep between stages to stand in for a
+// real inter-machine hop. Because TWO driver threads write to and read from the SAME two connections
+// concurrently, and stage_worker_run does not promise to reply in send order once more than one request_id
+// is in flight (that is the whole point of wire v4), a connection needs its own demultiplexer on this
+// (test/daemon) side too - the same problem stage_worker.hpp solves for a real daemon, solved here in
+// miniature so the test itself does not introduce a race that looks like a production bug.
+
+using Clock = std::chrono::steady_clock;
+
+// Reads frames off one connection in its own thread and routes them (by request_id) to whichever caller
+// is blocked in recv_for() waiting for that request's next frame. Without this, two driver threads
+// reading the same connection directly could each accidentally consume the OTHER's reply.
+class FrameDemux {
+public:
+    explicit FrameDemux(BoundarySocket& conn) : conn_(conn) {
+        reader_ = std::thread([this] { run(); });
+    }
+    ~FrameDemux() { if (reader_.joinable()) reader_.join(); }
+
+    bool send(const BoundaryFrame& f) {
+        std::lock_guard<std::mutex> lock(send_mu_);
+        std::vector<uint8_t> bytes;
+        std::string err;
+        if (!boundary_serialize(f, bytes, err)) return false;
+        return conn_.send_frame(bytes, err);
+    }
+
+    BoundaryFrame recv_for(uint64_t request_id) {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [&] { return !queues_[request_id].empty() || done_; });
+        BoundaryFrame f = std::move(queues_[request_id].front());
+        queues_[request_id].pop_front();
+        return f;
+    }
+
+private:
+    void run() {
+        for (;;) {
+            std::vector<uint8_t> bytes;
+            std::string err;
+            if (!conn_.recv_frame(bytes, err, 1 << 20)) {
+                std::lock_guard<std::mutex> lock(mu_);
+                done_ = true;
+                cv_.notify_all();
+                return;
+            }
+            BoundaryFrame f;
+            if (!boundary_deserialize(bytes.data(), bytes.size(), f, err)) {
+                std::lock_guard<std::mutex> lock(mu_);
+                done_ = true;
+                cv_.notify_all();
+                return;
+            }
+            std::lock_guard<std::mutex> lock(mu_);
+            queues_[f.request_id].push_back(std::move(f));
+            cv_.notify_all();
+        }
+    }
+
+    BoundarySocket& conn_;
+    std::mutex mu_, send_mu_;
+    std::condition_variable cv_;
+    std::unordered_map<uint64_t, std::deque<BoundaryFrame>> queues_;
+    bool done_ = false;
+    std::thread reader_;
+};
+
+void section_d() {
+    std::fprintf(stderr, "[section D: real two-stage chain, timing-based overlap proof]\n");
+
+    BoundarySocket a_data_l, a_signal_l, b_data_l, b_signal_l;
+    int a_data_p = 0, a_signal_p = 0, b_data_p = 0, b_signal_p = 0;
+    std::string err;
+    check(a_data_l.listen_on(0, a_data_p, err), "D: stage A data listener bound");
+    check(a_signal_l.listen_on(0, a_signal_p, err), "D: stage A signal listener bound");
+    check(b_data_l.listen_on(0, b_data_p, err), "D: stage B data listener bound");
+    check(b_signal_l.listen_on(0, b_signal_p, err), "D: stage B signal listener bound");
+
+    StageWorkerConfig cfg_a, cfg_b;
+    cfg_a.worker_data_endpoint = "127.0.0.1:" + std::to_string(a_data_p);
+    cfg_a.worker_signal_endpoint = "127.0.0.1:" + std::to_string(a_signal_p);
+    cfg_a.instance_id = "stage-a"; cfg_a.lo = 0; cfg_a.hi = 1; cfg_a.batch = 2;
+    cfg_b.worker_data_endpoint = "127.0.0.1:" + std::to_string(b_data_p);
+    cfg_b.worker_signal_endpoint = "127.0.0.1:" + std::to_string(b_signal_p);
+    cfg_b.instance_id = "stage-b"; cfg_b.lo = 1; cfg_b.hi = 2; cfg_b.batch = 2;
+
+    struct Interval { std::string label; Clock::time_point start, end; };
+    std::mutex log_mu;
+    std::vector<Interval> compute_log;   // tagged by request label, not which stage - see make_compute
+
+    // Identifies which logical request a position belongs to by the TOKEN VALUE's range, not request_id:
+    // stage A's compute callback gets `input == nullptr` for lo == 0 (StageWorkerCompute's own comment),
+    // so there is nothing to read a request_id off of inside compute() itself. Request 1's tokens stay in
+    // [1000, 2000); request 2's in [2000, 3000) - both stages just do token + 1, so the range survives
+    // every hop, which is enough to label a compute event without threading request_id through the
+    // callback signature just for this test.
+    auto label_for = [](int32_t token) { return token < 2000 ? std::string("R1") : std::string("R2"); };
+    auto make_compute = [&](int compute_ms) {
+        return [&log_mu, &compute_log, compute_ms, label_for](int, const BoundaryFrame*, int32_t token, int64_t,
+                                                               BoundaryFrame& out, std::string&) {
+            const auto t0 = Clock::now();
+            std::this_thread::sleep_for(std::chrono::milliseconds(compute_ms));
+            const auto t1 = Clock::now();
+            out.next_token.assign(1, token + 1);
+            out.n_tensors = 0;
+            std::lock_guard<std::mutex> lock(log_mu);
+            compute_log.push_back({label_for(token), t0, t1});
+            return true;
+        };
+    };
+    StageWorkerCompute compute_a = make_compute(5);
+    StageWorkerCompute compute_b = make_compute(5);
+    StageWorkerReset reset = [](int, std::string&) { return true; };
+    StageWorkerPrefill prefill = nullptr;
+
+    std::string err_a, err_b;
+    StageWorkerStats stats_a, stats_b;
+    std::thread worker_a([&] { stage_worker_run(cfg_a, compute_a, reset, prefill, &stats_a, err_a); });
+    std::thread worker_b([&] { stage_worker_run(cfg_b, compute_b, reset, prefill, &stats_b, err_b); });
+
+    BoundarySocket a_data, a_signal, b_data, b_signal;
+    check(a_data_l.accept_one(a_data, err), "D: stage A data accepted");
+    check(daemon_hello(a_data, "stage-a", 0, 1), "D: stage A data hello");
+    check(a_signal_l.accept_one(a_signal, err), "D: stage A signal accepted");
+    check(daemon_hello(a_signal, "stage-a", 0, 1), "D: stage A signal hello");
+    check(daemon_recv_ready(a_data), "D: stage A ready");
+    check(b_data_l.accept_one(b_data, err), "D: stage B data accepted");
+    check(daemon_hello(b_data, "stage-b", 1, 2), "D: stage B data hello");
+    check(b_signal_l.accept_one(b_signal, err), "D: stage B signal accepted");
+    check(daemon_hello(b_signal, "stage-b", 1, 2), "D: stage B signal hello");
+    check(daemon_recv_ready(b_data), "D: stage B ready");
+
+    FrameDemux a_demux(a_data), b_demux(b_data);
+
+    struct TransitLog { std::string label; Clock::time_point start, end; };
+    std::mutex transit_mu;
+    std::vector<TransitLog> transit_log;
+
+    const int kPositions = 4;
+    const int kTransitMs = 40;   // >> compute_ms (5): the window the overlap proof below needs to be real
+
+    // One full round trip per position: stage A, an artificial A->B transit delay, stage B, an artificial
+    // B->A transit delay (closing the ring back to the head) - see boundary_wire.hpp's header comment on
+    // why a single request's own path is a cycle back to its entry stage.
+    auto drive = [&](const std::string& label, uint64_t request_id, int32_t start_token) {
+        int32_t token = start_token;
+        for (int i = 0; i < kPositions; ++i) {
+            BoundaryFrame in_a;
+            in_a.kind = kBoundaryRows;
+            in_a.request_id = request_id;
+            in_a.pos0 = (int64_t) i;
+            in_a.rows = 1;
+            in_a.next_token = {token};
+            a_demux.send(in_a);
+            BoundaryFrame out_a = a_demux.recv_for(request_id);
+
+            const auto t0 = Clock::now();
+            std::this_thread::sleep_for(std::chrono::milliseconds(kTransitMs));
+            const auto t1 = Clock::now();
+            { std::lock_guard<std::mutex> lock(transit_mu); transit_log.push_back({label, t0, t1}); }
+
+            BoundaryFrame in_b = out_a;
+            in_b.request_id = request_id;
+            b_demux.send(in_b);
+            BoundaryFrame out_b = b_demux.recv_for(request_id);
+
+            const auto t2 = Clock::now();
+            std::this_thread::sleep_for(std::chrono::milliseconds(kTransitMs));
+            const auto t3 = Clock::now();
+            { std::lock_guard<std::mutex> lock(transit_mu); transit_log.push_back({label, t2, t3}); }
+
+            token = out_b.next_token.empty() ? -1 : out_b.next_token[0];
+        }
+    };
+
+    std::thread d1([&] { drive("R1", 1, 1000); });
+    std::thread d2([&] { drive("R2", 2, 2000); });
+    d1.join();
+    d2.join();
+
+    // THE PROOF: a transit interval belonging to one request overlapping, in REAL wall-clock time, with a
+    // compute interval belonging to the OTHER request - not "both eventually finished", but a stage
+    // genuinely computing request Y's position during a window where request Z's frame was away in
+    // (simulated) transit, not at that stage at all.
+    auto overlaps = [](Clock::time_point a0, Clock::time_point a1, Clock::time_point b0, Clock::time_point b1) {
+        return a0 < b1 && b0 < a1;
+    };
+    int overlap_count = 0;
+    for (const auto& t : transit_log) {
+        for (const auto& c : compute_log) {
+            if (c.label == t.label) continue;   // must be the OTHER request
+            if (overlaps(t.start, t.end, c.start, c.end)) ++overlap_count;
+        }
+    }
+    std::fprintf(stderr,
+                "  (section D: %d compute/transit overlaps found across %zu transit windows and %zu "
+                "compute events)\n",
+                overlap_count, transit_log.size(), compute_log.size());
+    check(overlap_count > 0,
+         "D: found a real wall-clock overlap - a stage computed one request's position WHILE the other "
+         "request's frame was in (simulated) transit elsewhere, not merely interleaved after the fact");
+
+    // Correctness, not just timing: both requests were admitted exactly once per stage despite running
+    // concurrently through two real driver threads, not one thread sending frames back-to-back.
+    check(stats_a.requests == 2 && stats_b.requests == 2, "D: both stages saw both requests exactly once");
+
+    auto send_end = [&](uint64_t request_id) {
+        BoundaryFrame end_f;
+        end_f.kind = kBoundaryEnd;
+        end_f.request_id = request_id;
+        end_f.rows = 1;
+        a_demux.send(end_f);
+        b_demux.send(end_f);
+    };
+    send_end(1);
+    send_end(2);
+
+    auto send_shutdown = [&](BoundarySocket& signal_conn) {
+        json sd; sd["type"] = "shutdown"; sd["deadline_ms"] = 2000;
+        const std::string text = sd.dump();
+        std::vector<uint8_t> bytes(text.begin(), text.end());
+        std::string serr;
+        signal_conn.send_frame(bytes, serr);
+    };
+    send_shutdown(a_signal);
+    send_shutdown(b_signal);
+    worker_a.join();
+    worker_b.join();
+    check(err_a.empty(), "D: stage A stage_worker_run returned cleanly: " + err_a);
+    check(err_b.empty(), "D: stage B stage_worker_run returned cleanly: " + err_b);
 }
 
 }  // namespace
@@ -403,6 +662,7 @@ int main() {
     section_a();
     section_b();
     section_c();
+    section_d();
     std::fprintf(stderr, "\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

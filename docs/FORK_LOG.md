@@ -94,11 +94,12 @@ fire-and-forget：不需要独立的"已收到取消"回执，结果体现在该
       **缺口已部分补上**：entry stage 且被 entry bridge 认得的 request_id，取消现在回真正的
       `error{code:"cancelled"}`（JSON，不再是看起来和正常结束一样的 `kBoundaryEnd`）；非 entry
       stage 仍是老行为（`kBoundaryEnd`，和正常结束在 wire 上长得一样），因为它没有 bridge 可查
-- [x] `stage_worker_run` 外层的 Tier 1 并发（按 request_id 隔离的交替处理，不是 `run_slot_rows`
-      合批）——架构待决项已确认（见下面 2026-11-18 小节），wire v4 + per-request 状态表 + entry
-      bridge 已实现并验证。`run_slot_rows` 合批（Tier 2）仍未动手，理由变了：不再是"架构不确定"，
-      而是"收益依赖专家是否 GPU 常驻，这轮刻意不做"（Tectonic 侧 ADR 0005 的决定，不是这个仓库
-      自己能下的判断）
+- [x] `stage_worker_run` 外层的并发——2026-11-18 的 Tier 1（按 request_id 隔离的交替处理，计算状态
+      仍单一常驻）之后，2026-11-19 补了 Tier 1.5：`batch` 个独立常驻 slot，decode 单步计算跨 slot
+      交替（`run_slot_rows(rows={slot}, S=1, ...)` 的形状，这次用假 compute 验证了调度逻辑，真正接
+      `Verifier`/`SessionState` 仍是 `generate.cpp` 侧独立工程项）。`run_slot_rows` 的 kernel 级合批
+      （Tier 2，多个 slot 合并进一次调用）仍未动手，理由不变：收益依赖专家是否 GPU 常驻，这轮刻意
+      不做（Tectonic 侧 ADR 0005 的决定，不是这个仓库自己能下的判断）
 - [x] 复核时补了一处遗漏：默认单次命令行模式下 `o.layer_begin > 0`（非 `--tectonic`、非
       `--split-devices`，现在只能通过 `--layers` 设置）过去唯一的输入来源是 `--stage-input`，
       删掉它之后这个组合会静默用全零的 hand-off buffer 跑出错误结果，而不是报错。现在在
@@ -193,6 +194,85 @@ entry stage 自己的请求生命周期外壳，stage 间的残差交换继续�
   覆盖了它。
 
 45 checks, 0 failed（`clang++ -std=c++20 -O1`，这台 Mac arm64 上，CPU-only）。
+
+## 2026-11-19：`batch` 个常驻 slot，交替单步计算（ADR 0005 补充决定，"Tier 1.5"）
+
+Tectonic 侧提出一个具体场景：多个 stage 顺序处理同一个请求的 decode 时，任意时刻只有一个 stage
+在真正计算，其余 N-1 个都在等这个请求自己的帧走完一圈环——这是自回归依赖本身决定的，单个请求无法
+绕开。**能绕开的是**：如果环上同时能放得下不同请求，一个 stage 在等请求 A 的帧在途的时候，本来可以
+用这段空闲时间算请求 B 的下一个位置。2026-11-18 的 Tier 1 只保证了"协议层不串数据"，计算状态仍然
+是单一一份常驻——这次要确认的是，"多份独立常驻 session、交替单步计算（不合批）"这件事，是否能和
+`run_slot_rows` 的合批（Tier 2，ADR 0005 明确搁置的部分）分开做。
+
+### 可分离性：读了真代码，不是推断
+
+- `include/strata/core/verify.hpp:248-258`（`run_slots`/`run_slot_rows` 的文档注释）："the slots not
+  listed are not touched, so an idle slot keeps its state"——独立 per-slot 状态是写在契约里的，不是
+  额外保证。
+- `src/core/verify.cpp:4713-4840`（`run_slot_rows` 实现本身）：**没有单独的"solo"代码路径**。
+  `run_slots(S,...)` 字面就是 `for t<S: rows[t]=t; return run_slot_rows(rows, S, ...)`。S=1 不是
+  特殊分支，是同一个函数退化到一行。
+- `src/program/generate.cpp:15916-15945`（`--serve` 自己的调度器）：把当下 `.active` 的 slot 收集
+  进 `rows[0..S)`，调用一次 `run_slot_rows`——`if (S == 0) return true;` 本来就要处理，S 退化成 1
+  是这套调度器自己日常就会走到的情况，不是新代码。
+- `src/program/generate.cpp:21276-21297`（`admit_slot`/`copy_to_slot`）：**`--serve` 自己的架构早就
+  把 prefill 和常驻 decode 分开**——一个请求先走 solo 路径把 prompt 读完，然后"入队"（`sl.active =
+  true`）进一个 slot，之后才走批量/独立 decode。这正是这次要做的设计（prefill 串行、decode 跨 slot
+  交替），不是凭空发明，是照抄已有架构。
+- `include/strata/prefill/prefill.hpp:82-83`（`Prefill::init`）：吃的是单个 `SessionState&`，不像
+  `Verifier` 那样是 slot 向量——`Prefill` 本身不是多 slot 的。这是唯一真正不确定的地方（两个 slot
+  的 prefill 要不要可能同时跑），但这次刻意不解决：prefill 继续严格串行（永远不并发跑两个），只有
+  decode 跨 slot 交替，和 `--serve` 自己的 admit 模式完全一致，这个不确定性不需要本轮回答。
+
+**结论：decode 单步计算跨 slot 交替，和 `run_slot_rows` 的 kernel 级合批是可分离的，而且有真实代码
+先例，不是臆测。**
+
+### 做了什么
+
+- `src/program/stage_worker.hpp`：
+  - `StageWorkerCompute`/`StageWorkerReset`/`StageWorkerPrefill` 三个回调都加了 `slot` 参数（第一个
+    参数）——调用方（`generate.cpp`，这次没有改，仍是下一步工程项）要把它绑定到
+    `Verifier::run_slot_rows(&slot, 1, ...)`／对应 slot 的 `SessionState`。
+  - `requests`/`PerRequestState`（2026-11-18 的单一 map）换成 `slot_state`（`batch` 个固定槽位）+
+    `request_slot`（request_id → slot 下标）。`ensure_slot`/`find_slot`/`release_slot` 三个辅助函数
+    取代了 `reset_request_state`。
+  - **新增一个后台"读线程"**，专门读 `link`（数据连接），把字节推进一个带条件变量的队列
+    （`incoming`），和主循环的计算/分发彻底解耦。没有这个，接纳一个新请求是不可能的：旧设计只有在
+    "无事可做"时才读 socket，意味着一个已经常驻的 slot 的自喂循环会一直堵住任何新 `gen` 的准入，
+    直到那个请求完全结束——这是写测试时发现的，不是预判到的（和上一轮 `current_request_id` 的 bug
+    一样，靠跑测试找出来，不是代码审查）。主循环现在每一轮都先非阻塞地看一眼 `incoming`，有就优先
+    处理，没有才去排 `pending`（自喂队列）——顺序反过来会让新准入排在已经常驻的 slot 后面挨饿。
+  - `EntryBridge::admit` 的 `max_in_flight` 现在传 `c.batch`（之前硬编码 1）。
+  - `entry_bridge.hpp` 的文件头注释更新：两条已知缺口（不检测 EOS、不处理真实跨机环闭合）原样保留，
+    新增一条——这次加的调度机制对它们没有影响，仍然是独立、未解决的问题。
+
+### 发现：原来 Tier 1 报告过的"gen 排队而不是拒绝"这个缺口，被这次的改动顺带修好了
+
+上一轮（2026-11-18）的测试记录过："一个 gen 在另一个处理期间发送，会排队，不会被当场拒绝"，原因是
+旧设计只有在空闲时才读 socket。这次加了"每轮都先看一眼 incoming"之后，重新测发现：**单 slot
+(`batch=1`) 的场景下，繁忙时发来的 `gen` 现在真的会在另一个请求还没结束时就收到活的
+`error{code:"batch_full"}`**，不再是悄悄排队——这是本轮改动的副作用，不是刻意修的，但确实修好了，
+已经用测试验证（见下面）。同时也确认了一个真实、固有的边界：这个"每轮检查"不是"计算中途可抢占"，
+如果一个请求的单步计算本身很快、自喂链条首尾相接没有间隙，第二个请求的 `gen` 字节有没有来得及被读
+线程送进 `incoming`、赶在当前请求释放 slot 之前被检查到，是一个真实的时序竞争，不是哪一边的 bug——
+写测试时第一次用很短的 `max_new`（2）复现了这个竞争并且输给了它，加长 `max_new` 给出足够的真实窗口
+后才稳定复现"繁忙时被拒绝"。这个边界条件记在这里，不是本轮的待办。
+
+### 验证：真实两段 stage 链路，带时间戳的重叠证据
+
+`tools/test_tier1_concurrency.cpp` 新增 Section D：两个真实的 `stage_worker_run` 实例（stage A
+`[0,1)`、stage B `[1,2)`，各 2 个常驻 slot），两个测试侧"driver"线程各自独立跑一个请求的完整环
+（A → 人为的"传输延迟"(40ms) → B → 人为的"传输延迟"(40ms) → 回到 A，4 个位置），伪计算本身只睡
+5ms。因为两个线程会并发读写同一对连接，且 `stage_worker_run` 不保证按发送顺序回复（这正是 wire v4
+要解决的问题），测试侧自己也要一个按 request_id 分发的解复用器（`FrameDemux`）——不这么做的话测试
+自己会引入一个看起来像被测代码 bug 的竞争。
+
+记录每次"传输延迟"的起止时间戳和每次 compute() 的起止时间戳（按 token 值所在的区间给请求打标签，
+因为 stage A 的 `compute()` 对 `lo==0` 收到的 `input` 是空指针，拿不到 request_id），然后找：
+请求 X 的传输延迟区间，和请求 Y（另一个）在同一个 stage 的 compute 区间，是否有真实的墙钟重叠。
+
+连续三次独立运行：16 个传输窗口里分别找到 13、14、15 个重叠——不是边界运气，是稳定可复现的真实
+时间重叠，不是"先后完成看起来像并发"。64 checks, 0 failed（含 A/B/C 三节）。
 
 ## 架构待决（已回到 Tectonic 侧确认，见上面 2026-11-18 小节）：`gen`/`delta`/`done` 和 BoundaryFrame 是什么关系
 

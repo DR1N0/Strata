@@ -1,11 +1,18 @@
 // Copyright (c) 2026 the Tectonic contributors (MIT).
 //
 // THE ENTRY BRIDGE: id-mapping and admission bookkeeping for the entry stage's gen/delta/done <->
-// BoundaryFrame translation (Tier 1, ADR 0005). See control_wire.hpp for the JSON message shapes this
-// bridge reads and writes, and stage_worker.hpp for where this plugs into the main loop - only an engine
-// started with layer_begin == 0 (the entry stage) ever constructs one.
+// BoundaryFrame translation (ADR 0005, extended by the ADR 0005 addendum - "Tier 1.5"). See control_wire.hpp
+// for the JSON message shapes this bridge reads and writes, and stage_worker.hpp for where this plugs into
+// the main loop - only an engine started with layer_begin == 0 (the entry stage) ever constructs one.
 //
-// TWO SCOPE CUTS, BOTH FLAGGED HERE RATHER THAN SILENTLY ASSUMED:
+// `max_in_flight` passed to admit() is now `batch` resident slots, not a hardcoded 1: stage_worker.hpp
+// assigns each admitted request its own slot (its own R/GDN/QSA-cache/PLE-history), and its main loop
+// interleaves single-slot decode steps across whichever requests have input ready, rather than fully
+// draining one request's self-feed chain before reading the socket for another. See docs/FORK_LOG.md's
+// 2026-11-19 section for the real-code evidence that this is separable from Verifier::run_slot_rows'
+// kernel-level batching (S > 1 in one call), which stays out of scope (ADR 0005's Tier 2).
+//
+// TWO SCOPE CUTS REMAIN, BOTH FLAGGED HERE RATHER THAN SILENTLY ASSUMED:
 //
 // 1. This bridge drives a single-stage (non-split) deployment's own decode continuation, counted by
 //    `max_new`. It does NOT detect EOS: the old Python daemon prototype's echo loop used to decide "stop
@@ -19,11 +26,13 @@
 //    telling "a BoundaryFrame returning to me is MY OWN request's ring closing" apart from "any other
 //    traffic a non-entry neighbour might send me", which needs more disambiguation state than this bridge
 //    has today (see stage_worker.hpp's integration point, gated on `out.n_tensors == 0 && c.lo == 0`,
-//    which is only a correct signal for a single-stage deployment that owns the whole model).
+//    which is only a correct signal for a single-stage deployment that owns the whole model). A real
+//    multi-stage chain's slot-indexed decode interleaving (the thing this round adds) is proven directly
+//    against raw BoundaryFrame traffic instead - see tools/test_tier1_concurrency.cpp's multi-stage section.
 //
-// Both are independent of the request_id plumbing (wire v4) itself, which is unconditionally correct and
-// usable by a future, more complete bridge without any changes to boundary_wire.hpp or stage_worker.hpp's
-// per-request map.
+// Both are independent of the request_id plumbing (wire v4) and the slot-indexed scheduling (this
+// addendum) themselves, which are unconditionally correct and usable by a future, more complete bridge
+// without further changes to boundary_wire.hpp or stage_worker.hpp's per-slot state.
 #pragma once
 
 #include <cstddef>
