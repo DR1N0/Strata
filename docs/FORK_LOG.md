@@ -479,6 +479,89 @@ indexer 的路由逻辑有关的、更底层的状态复用问题，但这两个
 说明还没找到那一块。**不建议现在就投入更多时间盲试下一个假设，比较值得的下一步是要么上 Metal 的
 GPU 调试工具直接看缓冲区内容，要么把这个现象整理成一个新 issue 发给上游，参考 #4908 的格式**。
 
+## 2026-11-19（续三）：找到真正的根因并修好了——`&ss` 在 `set_of_ss_` 里注册了两次
+
+**`--spec 0` 这条路排除了**：这个 native (IQ) pack 的 CLI 校验（`generate.cpp:5479`，
+`o.spec < 2` 直接拒绝）硬性要求 `--spec >= 2`，`--spec 0`／`--spec 1` 都在模型加载前就被拒绝，这个
+具体模型没法测"完全不跑投机解码"这条路径。但 `--spec N` 的帮助文本（"the MTP drafter's verify
+window: how many tokens it proposes per check"）和实测日志（`stream windows T=2` 确实出现过）说明
+投机解码是真的在跑；不过这条路最后被证明和真正的根因无关（见下）。
+
+**GPU 缓冲区读回，这次真的做了，不是只读日志**：在 `Window::commit()`（`window.cpp:2432`）结尾加了
+一段调试代码（`TECTONIC_DEBUG_BUFFERS=1`），在每次 commit 后把 `gst_[0]`／`ghist_[0][0]`／
+`ghist_[1][0]` 这几个 GDN 状态缓冲区（Apple Silicon 统一内存，`.ptr` 直接是 CPU 可读的指针，不需要
+`MTLCaptureManager`）求和，对比 A（prompt `[1,2,3]`）和 B（prompt `[10,20,30]`）各自 prefill 之后
+的数值。结果：
+
+```
+A: gst_[0] sum=107.736026 absum=1634.979140 | ghist_[0][0] sum=-3.527412 absum=41738.717532 | ghist_[1][0] sum=84.964309 absum=28237.515764
+B: gst_[0] sum=107.736026 absum=1634.979140 | ghist_[0][0] sum=-3.527412 absum=41738.717532 | ghist_[1][0] sum=84.964309 absum=28237.515764
+```
+
+**两组数字逐位相同**——B 用完全不同的 prompt token，prefill 之后的 GDN 状态却和 A 的一模一样，
+浮点数不可能"巧合"到这个精度。这不是"B 读到了 A 的陈旧状态"（那样应该是 A 的状态被 B 自己的新
+token 继续推进后的某个中间值，不会恰好停在 A 自己的终值上），而是**B 的 prefill 根本没有真正执行
+到它应该写入的那块缓冲区——它读写的是另一块从未被触碰过的缓冲区，而 `Window::run()`/`Prefill`
+实际使用的那块缓冲区，从 A 用完之后就原封不动地留在那里**。
+
+**读代码找到了为什么**：`Window::slots_init`（`window.cpp:2194-2211`）里有两行:
+
+```cpp
+v[0]->ss = ss_;
+set_of_ss_[ss_] = 0;              // 这一行先把 solo session 登记成 set 0
+...
+for (size_t b = 0; b < slots.size(); ++b) {
+    ...
+    set_of_ss_[slots[b]] = (int) b + 1;   // 这一行把传进来的每个 slot session 登记成 set b+1
+}
+```
+
+**这次改动自己的 bug**：`generate.cpp` 把 `&ss`（`Verifier::init` 已经绑定成 solo session、也是
+`Prefill`/`Window::run` 真正读写的那份状态）**同时也塞进了 `slot_sessions[0]`** 传给
+`init_slots`。于是上面第二个循环跑到 `b=0` 时，`slots[0] == &ss`，`set_of_ss_[&ss]` 被
+**覆盖成 1**——`window_reset(&ss)`（`session_zero` 的 Metal 实现）此后查到的永远是 1，不是 0，
+`activate(set_of(&ss)=1)` 激活的是**slot 0 自己的一套独立缓冲区，不是 solo/live 那一套**。
+`Window::reset()` 确实把"当前激活"的那套清零了——只是清错了一套，`Prefill`/`Window::run` 真正
+读写的 solo/live 缓冲区从来没被清过。
+
+这解释了之前两轮的每一个现象：
+- **第一次永远对**：全新进程里 solo/live 和 slot 0 的缓冲区都是刚分配的全零，清哪一套都一样，
+  这个 bug 完全观察不到。
+- **第二次永远错，和 slot 编号、并发/顺序无关**：只要是"这个 `Verifier` 第二次跑 solo prime"，
+  无论这次 entry bridge 把它记成哪个逻辑 slot，`reset_stage` 清的都还是同一个（错的）内部 set，
+  solo/live 缓冲区永远不会被真正清空。
+- **`predict(pos) == token_at(pos-2)` 这个精确规律**：这次没有单独去复现这个子现象验证因果，但
+  given 缓冲区从未被清空、也可能从未被 B 自己的 prefill 真正写入（见下一条），这类"整个计算链条读的
+  是上一个会话原封不动的残留输入"的 bug，产出一个和上一个会话的某种确定性函数相关的输出，是完全
+  说得通的，不需要再假设"2"和 `--spec 2` 有什么关系——那条线索看来是巧合。
+- **`hp_`／`pooled_`／K-V 清零都测不出效果**：因为这几个修复都发生在**错误的那个 set**（slot 0）
+  上，从来没有碰到真正在用的 solo/live 缓冲区，清不清都不影响结果。这也解释了为什么这几个方向
+  "读代码很有道理，实测却都没用"——不是假设错了，是从一开始就在改错的内存。
+
+**修法**：`ss` 不再出现在传给 `init_slots` 的 slot 列表里——它只属于 `Verifier::init`／
+`Prefill::init`，专门服务于每个新会话的 solo priming 这一步（`compute_stage` 的 `!primed`
+分支）。`n_slots` 个逻辑 slot（包括原来的"slot 0"）现在全部用**全新 carve** 的 `SessionState`，
+一个都不借用 `&ss`。
+
+**验证（真实模型，真实 Metal 计算，和之前两轮同一个 bar）**：
+
+- 顺序测试（A→B→C 三个完全不同的会话，连续在同一个进程里跑）：`[4,5,6,24218]` /
+  `[198,10,20,30]` / `[220,248046,871,606]`，**全部和各自独立 solo 跑出来的 ground truth 字节级
+  一致**，三个会话都对，不只是前两个。
+- 并发测试（A、B 真正交替在途，`--batch 2`）：两个请求都对，互不串流
+  （`tools/test_tier1_concurrency.cpp` 风格的"真实 wall-clock 重叠"这次没有重新测，但结果本身已经
+  用 token 序列证明了两个 slot 各自保有自己独立正确的状态）。
+- 单请求（`--batch 1`）：仍然 `[4,5,6,24218]`，没有回归。
+- 两套既有的假 compute 测试套件（`tools/test_tier1_concurrency.cpp` 64 checks、
+  `tools/test_boundary_wire.cpp` 191 checks）重新跑，全过，不受影响（这次改动完全在
+  `generate.cpp` 里，没碰 `stage_worker.hpp`）。
+
+**这一次，Tier 1.5 在真实模型、真实 Metal 计算、真实并发场景下，第一次做到了完整正确**——不是
+"单请求对、多会话还有问题"，是两条路径（顺序复用、并发交替）都对。前两轮加的 `pooled_` 清零修复
+继续保留（它本身是独立、正确的修复，CUDA/HIP 的 `qsa_state_zero` 就是这么做的，只是不是这次这个
+bug 的根因）；`TECTONIC_DEBUG_COMPUTE`／`TECTONIC_DEBUG_BUFFERS`／`TECTONIC_DEBUG_ZERO_KV` 三个
+调试钩子都保留，默认关闭，留给以后类似问题用。
+
 ## 架构待决（已回到 Tectonic 侧确认，见上面 2026-11-18 小节）：`gen`/`delta`/`done` 和 BoundaryFrame 是什么关系
 
 这是挡住并发调度层（`run_slot_rows` 接入）的真正问题，不是"不知道怎么写代码"，是"不知道这段

@@ -21654,8 +21654,25 @@ int main(int argc, char** argv) {
         // read/written by at most one stage_worker_run compute() call at a time (that loop is single-threaded;
         // "interleaved" means temporally alternating across calls, never two calls in flight together), so no
         // locking is needed here beyond what session_zero/run_slot_rows already assume for a single caller.
+        //
+        // ROOT CAUSE FOUND (not by review - by diffing real GPU buffer checksums between a correct first
+        // conversation and a wrong second one, which came out byte-identical despite different prompts):
+        // `ss` must NOT be one of the SessionState pointers handed to init_slots. Metal's Window keeps one
+        // set_of_ss_ map from SessionState* to internal "set" index; slots_init already registers
+        // `set_of_ss_[ss_] = 0` for the solo/priming session (ss_ is bound to `ss` by Verifier::init above).
+        // Reusing `&ss` as slot_sessions[0] makes init_slots's own loop immediately overwrite that entry to
+        // `set_of_ss_[&ss] = 1` - after that, window_reset(&ss) (called by every reset_stage) activates and
+        // zeroes SLOT 0's Metal-window buffers, never the solo set's, so the buffers Prefill/Window::run
+        // actually read and write are never cleared between conversations. A first-ever conversation looks
+        // correct anyway because everything starts zeroed regardless of which set got (redundantly) zeroed;
+        // a second one reads the first one's stale live state untouched - which is exactly the "always
+        // right the first time, always wrong afterward" symptom, and exactly why the wrong buffer's checksum
+        // came out identical to the previous conversation's, not just "non-zero": it was never touched.
+        // Fix: `ss` stays exclusively the Verifier's/Prefill's solo session, used for every conversation's
+        // priming step (see compute_stage's `!primed` branch); ALL n_slots logical slots - including what
+        // used to be "slot 0" - get their own freshly carved SessionState here, none of them `&ss`.
         const int n_slots = o.batch > 0 ? (int) o.batch : 1;
-        std::vector<strata::core::SessionState> extra_sessions((size_t) std::max(0, n_slots - 1));
+        std::vector<strata::core::SessionState> extra_sessions((size_t) n_slots);
         for (auto& s : extra_sessions) {
             void* sbuf_slot = nullptr;
             if (cudaMalloc(&sbuf_slot, strata::core::session_bytes(g, o.max_context, K, o.layer_begin, o.layer_end)) !=
@@ -21666,7 +21683,6 @@ int main(int argc, char** argv) {
             s.ple.hist = s.ple_hist;   // mirrors the shared setup's own line for `ss`, same reason
         }
         std::vector<strata::core::SessionState*> slot_sessions;
-        slot_sessions.push_back(&ss);
         for (auto& s : extra_sessions) slot_sessions.push_back(&s);
 
         const int64_t stage_hb = strata::core::Verifier::handoff_floats(g);

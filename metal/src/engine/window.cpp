@@ -2482,6 +2482,21 @@ bool Window::commit(int n_keep, std::string& err) {
         ss.ple_prev[0] = ss.ple_prev[1];
         ss.ple_prev[1] = last_tokens_[t];
     }
+    if (std::getenv("TECTONIC_DEBUG_BUFFERS")) {
+        auto sum = [](const mtl::Buffer& b) {
+            const float* f = (const float*) b.ptr;
+            double s = 0, sa = 0;
+            for (size_t i = 0; i < b.bytes / 4; ++i) { s += f[i]; sa += std::fabs((double) f[i]); }
+            return std::pair<double, double>(s, sa);
+        };
+        const auto g0 = sum(gst_[0]);
+        const auto h0 = sum(ghist_[0][0]);
+        const auto h1 = sum(ghist_[1][0]);
+        std::fprintf(stderr,
+                     "DBG commit: last_T_=%d n_keep=%d hp_(after)=%d pend_fold_=%d | gst_[0] sum=%.6f absum=%.6f | "
+                     "ghist_[0][0] sum=%.6f absum=%.6f | ghist_[1][0] sum=%.6f absum=%.6f\n",
+                     last_T_, n_keep, hp_, pend_fold_, g0.first, g0.second, h0.first, h0.second, h1.first, h1.second);
+    }
     return true;
 }
 
