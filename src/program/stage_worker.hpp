@@ -245,9 +245,16 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         ~SignalJoinGuard() { if (t && t->joinable()) t->join(); }
     } signal_join_guard{&signal_thread};
 
+    const bool debug_wire = std::getenv("STRATA_DEBUG_STAGE_WIRE") != nullptr;
     auto send = [&](const BoundaryFrame& f) {
         std::vector<uint8_t> bytes;
         if (!boundary_serialize(f, bytes, err)) return false;
+        if (debug_wire) {
+            std::fprintf(stderr, "[wire-debug lo=%lld hi=%lld] SEND kind=%d rows=%lld pos0=%lld request_id=%llu n_tensors=%d\n",
+                         (long long) c.lo, (long long) c.hi, (int) f.kind, (long long) f.rows, (long long) f.pos0,
+                         (unsigned long long) f.request_id, f.n_tensors);
+            std::fflush(stderr);
+        }
         const auto t0 = std::chrono::steady_clock::now();
         if (!link.send_frame(bytes, err)) return false;
         if (stats) {
@@ -276,10 +283,20 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
             std::vector<uint8_t> bytes;
             const auto t0 = std::chrono::steady_clock::now();
             if (!link.recv_frame(bytes, reader_err, size_t(256) << 20)) {
+                if (debug_wire) {
+                    std::fprintf(stderr, "[wire-debug lo=%lld hi=%lld] RECV FAILED: %s\n",
+                                 (long long) c.lo, (long long) c.hi, reader_err.c_str());
+                    std::fflush(stderr);
+                }
                 std::lock_guard<std::mutex> lock(incoming_mu);
                 reader_done = true;
                 incoming_cv.notify_all();
                 return;
+            }
+            if (debug_wire) {
+                std::fprintf(stderr, "[wire-debug lo=%lld hi=%lld] RECV bytes=%zu\n",
+                             (long long) c.lo, (long long) c.hi, bytes.size());
+                std::fflush(stderr);
             }
             if (stats) {
                 stats->net_recv_ms +=
@@ -297,6 +314,17 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         std::thread* t;
         ~ReaderJoinGuard() { if (t && t->joinable()) t->join(); }
     } reader_join_guard{&reader_thread};
+    // Declared last so it destructs first: closes both sockets before the join guards above run theirs.
+    // Without this, any return other than the signal thread's own kShutdown handling leaves the reader
+    // (and signal thread) blocked in recv_frame forever, and the joins above never complete.
+    struct CloseLinksGuard {
+        BoundarySocket* link;
+        BoundarySocket* signal_link;
+        ~CloseLinksGuard() {
+            if (link) link->close();
+            if (signal_link) signal_link->close();
+        }
+    } close_links_guard{&link, have_signal ? &signal_link : nullptr};
 
     // A stage with an upstream cannot act on one chunk frame: its prompt path needs EVERY row before it runs,
     // because those rows are one tensor in token order. So the upstream stage first sends the prompt itself (a
@@ -443,6 +471,12 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 const int slot = find_slot(in.request_id);
                 if (slot >= 0 && slot_state[(size_t) slot].pf_n >= 0) st = &slot_state[(size_t) slot];
             }
+            if (st == nullptr && debug_wire) {
+                std::fprintf(stderr, "[wire-debug lo=%lld hi=%lld] DROPPED kBoundaryPrompt chunk for request_id=%llu "
+                             "- no kBoundaryRequest ever initialized this slot's pf_n\n",
+                             (long long) c.lo, (long long) c.hi, (unsigned long long) in.request_id);
+                std::fflush(stderr);
+            }
             if (st != nullptr) {
                 const BoundaryTensor* r = in.find("R");
                 if (r == nullptr || r->rows != in.rows || r->elems_per_row <= 0) {
@@ -475,15 +509,10 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                     st->pf_n = -1; st->pf_rows.clear(); st->pf_elems = 0;
                 }
                 if (!ok) return false;
-                // A stage that emits chunks implies completion by emitting them; a stage that accumulated them has to
-                // say so, or the agent has no way to know the prompt is done and the next frame is welcome.
-                if (c.lo > 0) {
-                    BoundaryFrame ack;
-                    ack.kind = kBoundaryReady;
-                    ack.rows = 1;
-                    ack.request_id = in.request_id;
-                    if (!send(ack)) return false;
-                }
+                // No ack here: nothing downstream waits for one (entry sends the first decode frame right after
+                // its own prefill, not after hearing from this stage), and the mesh relay forwards every
+                // boundary-shaped frame it sees - a stray kBoundaryReady would reach entry's own dispatch and be
+                // mistaken for a new position-0 request (found by running the real two-node case, not review).
                 continue;
             }
         }
@@ -508,14 +537,23 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
             }
             if (slot < 0) { err = "worker: a prompt frame continues a request this stage never started"; return false; }
             auto emit = [&](BoundaryFrame& f) {
-                f.kind = kBoundaryPrompt;          // the same prompt rows, chunk by chunk
+                // kBoundaryRequest (the accumulation header a split prefill sends once, before any rows) is the
+                // one kind this prompt path emits itself rather than defaulting - everything else is the same
+                // prompt rows, chunk by chunk.
+                if (f.kind != kBoundaryRequest) f.kind = kBoundaryPrompt;
                 f.request_id = in.request_id;
                 f.layer_begin = c.lo;
                 f.layer_end = c.hi;
                 return send(f);
             };
             const auto t_prefill = std::chrono::steady_clock::now();
-            if (!prefill(slot, in.next_token.data(), in.rows, in.pos0, nullptr, 0, emit, err)) return false;
+            const bool prefill_ok = prefill(slot, in.next_token.data(), in.rows, in.pos0, nullptr, 0, emit, err);
+            if (debug_wire) {
+                std::fprintf(stderr, "[wire-debug lo=%lld hi=%lld] prefill() call site returned ok=%d err=%s\n",
+                             (long long) c.lo, (long long) c.hi, (int) prefill_ok, err.c_str());
+                std::fflush(stderr);
+            }
+            if (!prefill_ok) return false;
             if (stats) {
                 stats->positions += in.rows;
                 stats->prompt_positions += in.rows;
@@ -527,6 +565,16 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         }
         if (in.kind == kBoundaryEnd) {
             // END closes one request, not the engine: a resident stage serves the next request without reloading.
+            // Arriving here at entry is always a downstream stage's own cancellation (a normal finish is entry's
+            // own call - see the ring-closing branch above, which sends kBoundaryEnd onward but never receives it
+            // back): the client is still on an open connection waiting for something, so tell it.
+            if (c.entry_bridge != nullptr && c.lo == 0) {
+                std::string tectonic_id;
+                if (c.entry_bridge->resolve(in.request_id, tectonic_id)) {
+                    if (!control_send_error(link, tectonic_id, "cancelled", "request cancelled", err)) return false;
+                    c.entry_bridge->release(in.request_id);
+                }
+            }
             {
                 std::lock_guard<std::mutex> lock(state_mu);
                 release_slot(in.request_id);
@@ -610,6 +658,44 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
             std::lock_guard<std::mutex> lock(state_mu);
             release_slot(in.request_id);
             continue;
+        }
+        if (c.entry_bridge != nullptr && c.lo == 0 && in.layer_begin > 0) {
+            // A split entry's own locally-synthesized frames (prompt_part, first_decode) never set
+            // layer_begin, so layer_begin > 0 here can only mean this came back off the wire: the ring
+            // closed, and in.next_token[0] is the real stage's real sampled token, not something to embed
+            // and forward again as-is. Report it, then (if more are wanted) re-embed it at the next
+            // position - this is the split counterpart of the n_tensors == 0 check below, which only a
+            // single-stage deployment's self-loop ever hits.
+            const int32_t sampled = in.next_token.empty() ? -1 : in.next_token[0];
+            std::string tectonic_id;
+            if (!c.entry_bridge->resolve(in.request_id, tectonic_id)) {
+                err = "worker: entry bridge lost request_id " + std::to_string(in.request_id);
+                return false;
+            }
+            std::vector<int32_t> tokens_so_far;
+            const bool more = c.entry_bridge->record_token(in.request_id, sampled, tokens_so_far);
+            if (!control_send_delta(link, tectonic_id, sampled, err)) return false;
+            if (!more) {
+                if (!control_send_done(link, tectonic_id, tokens_so_far, err)) return false;
+                c.entry_bridge->release(in.request_id);
+                // Tell the downstream too: it has no entry bridge and no other way to learn this request is
+                // over, and with a resident slot per request (not reallocated per call) its slot would stay
+                // held forever otherwise - found by running a second request right after the first, which
+                // the held slot then refused outright.
+                BoundaryFrame end_frame;
+                end_frame.kind = kBoundaryEnd;
+                end_frame.request_id = in.request_id;
+                end_frame.rows = 1;
+                end_frame.layer_begin = c.lo;
+                end_frame.layer_end = c.hi;
+                if (!send(end_frame)) return false;
+                std::lock_guard<std::mutex> lock(state_mu);
+                release_slot(in.request_id);
+                continue;
+            }
+            in.pos0 += 1;
+            in.next_token.assign(1, sampled);
+            in.layer_begin = 0;
         }
         const int32_t token = in.next_token.empty() ? -1 : in.next_token[0];
         const auto t0 = std::chrono::steady_clock::now();

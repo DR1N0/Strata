@@ -12,25 +12,20 @@
 // 2026-11-19 section for the real-code evidence that this is separable from Verifier::run_slot_rows'
 // kernel-level batching (S > 1 in one call), which stays out of scope (ADR 0005's Tier 2).
 //
-// TWO SCOPE CUTS REMAIN, BOTH FLAGGED HERE RATHER THAN SILENTLY ASSUMED:
+// ONE SCOPE CUT REMAINS, FLAGGED HERE RATHER THAN SILENTLY ASSUMED:
 //
-// 1. This bridge drives a single-stage (non-split) deployment's own decode continuation, counted by
-//    `max_new`. It does NOT detect EOS: the old Python daemon prototype's echo loop used to decide "stop
-//    sampling" by comparing the sampled token against a model's EOS id, which this bridge has no way to
-//    know (stage_worker.hpp is model-agnostic by design - see its own header comment). Until an EOS id (or
-//    an EOS flag on BoundaryFrame/the compute callback's output) is threaded down to this layer, a request
-//    only ever ends by reaching `max_new` or being cancelled. Real generation will run past the point a
-//    real model would have stopped itself; this is wrong for production text quality, not for the wire
-//    mechanics this round is about.
-// 2. Translating a multi-machine split's ring-closing token back to JSON is NOT implemented: that needs
-//    telling "a BoundaryFrame returning to me is MY OWN request's ring closing" apart from "any other
-//    traffic a non-entry neighbour might send me", which needs more disambiguation state than this bridge
-//    has today (see stage_worker.hpp's integration point, gated on `out.n_tensors == 0 && c.lo == 0`,
-//    which is only a correct signal for a single-stage deployment that owns the whole model). A real
-//    multi-stage chain's slot-indexed decode interleaving (the thing this round adds) is proven directly
-//    against raw BoundaryFrame traffic instead - see tools/test_tier1_concurrency.cpp's multi-stage section.
+// This bridge drives decode continuation, counted by `max_new`, for both a single-stage deployment (its own
+// self-loop, stage_worker.hpp's `out.n_tensors == 0 && c.lo == 0` check) and a split one (a ring-closing
+// frame back from the real last stage, told apart by `in.layer_begin > 0` - a locally-synthesized admission
+// frame never sets it). Neither path detects EOS: the old Python daemon prototype's echo loop used to decide
+// "stop sampling" by comparing the sampled token against a model's EOS id, which this bridge has no way to
+// know (stage_worker.hpp is model-agnostic by design - see its own header comment). Until an EOS id (or an
+// EOS flag on BoundaryFrame/the compute callback's output) is threaded down to this layer, a request only
+// ever ends by reaching `max_new` or being cancelled. Real generation will run past the point a real model
+// would have stopped itself; this is wrong for production text quality, not for the wire mechanics this
+// round is about.
 //
-// Both are independent of the request_id plumbing (wire v4) and the slot-indexed scheduling (this
+// This is independent of the request_id plumbing (wire v4) and the slot-indexed scheduling (the ADR 0005
 // addendum) themselves, which are unconditionally correct and usable by a future, more complete bridge
 // without further changes to boundary_wire.hpp or stage_worker.hpp's per-slot state.
 #pragma once

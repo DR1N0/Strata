@@ -21734,7 +21734,12 @@ int main(int argc, char** argv) {
         // (expert table, synchronisation) forty times over. Prefill wants chunks large enough for that overhead to
         // disappear; the wire wants frames small enough for the peer to buffer. So a 2048-row chunk is cut into
         // 512-row frames on the way out.
-        const int64_t stage_chunk = 2048;
+        //
+        // A split stage is the one exception: the Metal window (metal/src/engine/stage.h, StagePlan::window)
+        // refuses more than one row per call once a stage owns less than the whole model. Chunk size must
+        // drop to 1 there, trading the amortization win above for being able to run at all.
+        const bool stage_is_split = o.layer_begin > 0 || o.layer_end < g.n_layers;
+        const int64_t stage_chunk = stage_is_split ? 1 : 2048;
         const int64_t stage_frame_rows = 512;
         // ONE shared Prefill, bound to `ss` only - NOT one per slot (an earlier version of this change tried
         // that; it was wrong, found by actually running real decode compute, not by review). The Metal
@@ -21777,6 +21782,16 @@ int main(int argc, char** argv) {
                 pf.set_hand_in(hand_rows);       // this stage starts from its predecessor's rows
             } else if (o.layer_begin > 0) {
                 pe = "stage: a non-entry stage needs the prompt's rows"; return false;
+            }
+            if (hand_rows == nullptr && o.layer_end < g.n_layers) {
+                // Entry owns the embedding, so it is the one that knows the whole prompt up front - tell the
+                // downstream how many rows to accumulate before it tries to run anything, via the one kind this
+                // path doesn't default `emit` to (see stage_worker.hpp's emit lambda).
+                strata::core::BoundaryFrame header;
+                header.kind = strata::core::kBoundaryRequest;
+                header.rows = n;
+                header.next_token.assign(tokens, tokens + n);
+                if (!emit(header)) { pe = "stage: sending the prompt's kBoundaryRequest header failed"; return false; }
             }
             // ONE FRAME PER CHUNK, CUT SMALLER IF NEEDED. Prefill wants chunks big enough that its per-chunk cost
             // disappears; the wire wants frames small enough for the peer to buffer. Those are different limits.
@@ -21842,7 +21857,17 @@ int main(int argc, char** argv) {
         };
         auto compute_stage = [&](int slot, const strata::core::BoundaryFrame* input, int32_t token, int64_t pos,
                                 strata::core::BoundaryFrame& output, std::string& re) -> bool {
-            if (token < 0 || token >= g.n_vocab) { re = "stage: invalid input token"; return false; }
+            // A non-entry stage gets its real input from `input`'s boundary tensors, not by embedding
+            // `token` itself - so a hand-off frame built before the next token was known (the prefill
+            // path's own last position, reported separately via the entry's first-decode frame) can
+            // legitimately arrive here as -1. Only an entry stage actually embeds from `token`.
+            if (o.layer_begin == 0) {
+                if (token < 0 || token >= g.n_vocab) { re = "stage: invalid input token"; return false; }
+            } else if (token < 0) {
+                token = 0;
+            } else if (token >= g.n_vocab) {
+                re = "stage: invalid input token"; return false;
+            }
             if (!kvg_ensure(pos + 64, [] { cudaDeviceSynchronize(); })) { re = "stage: KV capacity failed"; return false; }
             const uint64_t stage_fb0 = src.file_read_bytes();
             if (o.layer_begin > 0) {

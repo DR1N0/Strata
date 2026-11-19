@@ -251,6 +251,7 @@ public:
         return true;
     }
     bool last_stage() const { return stage_.last(); }
+    bool split_stage() const { return stage_.split(); }
     bool boundary_capture(float* r, float* bo, float* inj, int t, int64_t pos, std::string& err) const;
     bool boundary_apply(const float* r, const float* bo, const float* inj, int t, std::string& err);
     bool run(int T, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err);
@@ -2192,7 +2193,8 @@ void Window::alloc_set(SeqSet& o, bool real, int idx) {
 }
 
 bool Window::slots_init(const std::vector<strata::core::SessionState*>& slots, std::string& err) {
-    if (stage_.split()) { err = "metal stage: batch slots are not supported by L0"; return false; }
+    // Split-stage refusal removed (was ff277821d, a pre-Tier-1.5 scope cut never revisited since;
+    // alloc_set below is already layer-range-generic, and CUDA/HIP's init_slots has no such guard).
     if (!sets_.empty()) return true;   // (asked once)
     if (cx_ == nullptr) { err = "metal window: slots before the window is up"; return false; }
     std::vector<std::unique_ptr<SeqSet>> v;
@@ -3788,13 +3790,18 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
     static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
+    // A split stage must never fall through to the plain per-position loop below for a prompt: that loop carries
+    // rows through Window::run's one-row decode handoff, which has no slot for a multi-row residual. The GEMM
+    // paths above it are the only ones wired to prompt_hand_, so a split stage always takes one of them,
+    // regardless of how short the prompt is.
+    const bool split = g_window->split_stage();
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
-    if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
+    if (!windows && !g_window->streaming() && (split || n >= min_rows)) return g_window->prompt(tokens, n, pos0, on_chunk, err);
     if (!windows && g_window->streaming()) {
         const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM");
         const char* em = std::getenv("STRATA_METAL_PROMPT_GEMM_MIN");
         const int64_t mn = em ? std::atoll(em) : 64;
-        if (!(e && std::string(e) == "0") && n >= mn) {
+        if (!(e && std::string(e) == "0") && (split || n >= mn)) {
             if (!g_window->prompt_gemm_init(err)) return false;
             const int C = g_window->prompt_chunk_rows();
             std::vector<int32_t> tk32((size_t) C);
@@ -3812,9 +3819,12 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
             return ok;
         }
     }
+    // A split stage's window() call is T=1 only - this fallback otherwise batches up to MAXT rows, which a
+    // short prompt (too small for the GEMM paths above) would still hit.
+    const int step = g_window->split_stage() ? 1 : MAXT;
     int32_t tk[MAXT], out[MAXT];
-    for (int64_t c = 0; c < n; c += MAXT) {
-        const int k = (int) std::min<int64_t>(MAXT, n - c);
+    for (int64_t c = 0; c < n; c += step) {
+        const int k = (int) std::min<int64_t>(step, n - c);
         for (int i = 0; i < k; ++i) tk[i] = (int32_t) tokens[c + i];
         if (!g_window->run(k, tk, pos0 + c, false, out, err) || !g_window->commit(k, err)) return false;
         if (!g_window->tap_deliver_dec(k, pos0 + c, err)) return false;   // DFlash2

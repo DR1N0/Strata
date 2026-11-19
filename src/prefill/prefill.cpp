@@ -8980,7 +8980,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // DFlash2: the window writes the taps of the prompt rows at positions >= tap_first_ and hands them to on_taps after each chunk
         const bool taps = !tap_layers_.empty() && on_taps;
         if (taps && !strata::metal_engine::prompt_taps(tap_layers_, tap_first_, on_taps, err)) return false;
+        if (std::getenv("TECTONIC_DEBUG_COMPUTE")) { std::fprintf(stderr, "DBG Prefill::run: entering metal_engine::prompt_run n=%lld\n", (long long) n); std::fflush(stderr); }
         const bool ok = strata::metal_engine::prompt_run(tokens, n, pos0, embd_rows, hand_in_, on_chunk, err);
+        if (std::getenv("TECTONIC_DEBUG_COMPUTE")) { std::fprintf(stderr, "DBG Prefill::run: prompt_run returned ok=%d err=%s\n", (int) ok, err.c_str()); std::fflush(stderr); }
         if (taps) {
             std::string off_err;
             strata::metal_engine::prompt_taps(tap_layers_, 0, {}, off_err);   // no callback after the prompt

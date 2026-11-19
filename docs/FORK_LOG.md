@@ -617,6 +617,76 @@ Tectonic 的 `engine.md` 契约里，`gen` 请求带 `tokens[]`/`max_new`/`sampl
 这是 wire v4／Tier 1／Tier 1.5／真实 `Verifier` 绑定这条工作线第一次有"从 Tectonic 的两个 Go 命令
 发起，到真实模型真实产出一个正确答案"的完整端到端证据，不只是某一段链路的真实计算证据。
 
+## 2026-11-19（续五）：第一次真实两节点部署——回答了上面的架构待决，并发现修好四个新真问题
+
+上面"架构待决"一节留的问题现在有答案了：Tectonic 这边选的是**选项 1**——`gen`/`delta`/`done` 只是
+请求生命周期的外壳，entry stage 的引擎自己照旧通过 `BoundaryFrame` 和下一跳交换残差，daemon
+（Tectonic 的 `internal/mesh`）只在自己的数据连接和 mesh 连接之间原样转发字节，不解析、不参与。
+`stage_worker_run` 的收发循环因此完全不用重写，这一轮的改动全部是在现有循环里补协议逻辑，不是
+换架构。
+
+本仓库此前全部真实模型验证（含上面三轮单机证据）都只用过一个进程跑全部 48 层；这是第一次真的起两个
+真实 `tectonicd`（entry 跑 [0,24) 带 `model-frontend`，tail 跑 [24,48) 不带）、接同一个真实二进制、
+真实 Qwen3.8-Flash-Next 模型，走 Tectonic 新建的 mesh 转发。和之前每一轮一样，**真实执行比预先设计
+更快找到问题**——这次是四个，全部是 split 路径从未被任何代码路径真正跑过才会暴露的问题：
+
+**问题一：Metal 的 prompt 调度阈值把一个合法的短 prompt 甩进了不支持 split 的回退路径。**
+`prompt_run_rows`（`metal/src/engine/window.cpp`）对 54-token 的 prompt 算出的 `min_rows`/`mn`
+阈值（32/64）判它"太短，不值得走 GEMM 路径"，于是落进逐位置回退循环——这条回退循环走的是
+`Window::run` 的一行 decode handoff，没有地方放一个 split stage 的多行残差，必定出错
+（历史上一次类似的 "L0 supports T=1" 限制，见 `archive/l0-stage-split-20261117` 分支的
+`ff277821d`/`cfb7ed056`/`15830b469` 三个提交——当时也踩过"把投机解码窗口当 prefill chunk size"
+这同一类坑，现在的根因不同，但教训相同：split stage 的 prompt 处理是真正的 chunked 多行 GEMM，
+从来不可能一次只走一个 token）。今天的 GEMM/chunked 路径（`prompt_hand_`/`prompt_rows_ptr`/
+`window_rows_ptr`，`pc_chunk`/`prompt_chunk` 里的 `staged`/`LB`/`LE` 逻辑）其实已经是对的，只是
+阈值判断没把"这是不是一个 split stage"算进去。修法：split stage 无条件走 GEMM 路径，不论 prompt
+多短（`window.cpp`）。
+**问题二：entry 从没告诉下游"这是一整个 prompt，先攒够了再跑"。**
+`stage_worker.hpp` 里非 entry stage 累积 prompt 分片、凑够 `kBoundaryRequest` 声明的行数才真正调用
+`prefill()` 的逻辑其实早就写好了（`15830b469` 这条历史提交引入的同一套机制，在这个仓库的当前
+`main` 上内容一直都在），但从没有任何发送端真正发出过 `kBoundaryRequest` 头帧——这条累积逻辑是
+死代码，只是看起来存在。`generate.cpp` 的 `prefill_stage` 现在在 split stage 的真正 prefill 之前
+先经 `emit` 发一帧 `kBoundaryRequest`（`rows`=prompt 长度、`next_token`=整个 prompt），
+`stage_worker.hpp` 的 `emit` 相应放开了"总是强制 kind=kBoundaryPrompt"的默认行为，给这一种 kind
+放行。
+**问题三：一条只该本机消费的旧信号帧，被字节盲转发污染了 entry 自身的状态。**
+非 entry stage 攒完 prompt、真正跑完 prefill 之后会发一条 `kBoundaryReady` 确认帧——这是更早、
+非 mesh 架构下"告诉本机 agent 可以接着发了"的机制，但 entry 从不等这条确认就已经发出了它自己的
+第一个 decode 帧，今天没有任何代码等待它。Tectonic 的 mesh 转发是彻底字节盲的，分不出"这帧该留在
+本机"和"这帧该转发"，于是这条帧被原样转发回 entry，entry 的通用逐位置分发把它误判成一个
+"位置 0，新请求开始"的帧（它的 `pos0` 默认是 0，没人显式设过），当场把 entry 自己活跃的 KV 状态
+清零——这是实测直接看到的真实损坏，不是推测。修法：这条确认帧没有任何消费者，直接不再发送。
+**问题四：entry 完全没有识别"下游真实回环"的机制，decode 永远卡在同一个位置。**
+前三个问题修完后，prefill 能跑通了，但 decode 阶段 entry 会在同一个 `pos0` 上无限循环——每次都是
+不同的采样 token，但位置永远不前进，`delta`/`done` 永远不会发给客户端，`max_new` 也从未被检查。
+根因：`entry_bridge.hpp` 早就记录过这个 scope cut（"ring-closure 检测只对单 stage 部署正确，
+`out.n_tensors == 0 && c.lo == 0` 这个判据对 split entry 永远不成立"），但从没有实现过对应的
+split 判据。真正能用的判据是**输入帧**的 `in.layer_begin > 0`——entry 自己合成的帧（prompt_part、
+first_decode）从不设这个字段，只有真的从 wire 上绕一圈回来的帧才会非零，这是本地合成和下游回环
+两种帧之间唯一可靠的区分。`stage_worker.hpp` 新增这条判据：是回环帧就先向 `entry_bridge`
+报告这个真实采样 token（`delta`，`max_new` 到了就 `done`），到了才把它当新位置重新嵌入、继续走
+下一跳。**这又带出一个新发现的子问题**：entry 正常结束（`max_new` 到了）只告诉了 HTTP 客户端，
+没告诉 tail——tail 没有 entry bridge，也没有其他办法知道这个请求结束了，它的常驻 slot（`batch` 个
+里的一个）会永远占着不放。用两个连续请求（第二个紧跟第一个发出）直接实测复现：第二个请求的
+`kBoundaryRequest` 被 tail 拒绝（"no free slot for a new request"），整个 tail 进程退出。修法：
+entry 正常结束时也向下游发一条 `kBoundaryEnd`，让 tail 释放自己的 slot；对称地，entry 收到一条
+自己没有发起过的 `kBoundaryEnd`（今天的拓扑下只可能是下游自己决定结束——取消——因为正常结束永远
+是 entry 自己发起的），也要把它当作取消告诉 HTTP 客户端，而不是默不作声地释放状态、把客户端晾在
+一个永远不会关闭的连接上（这个子问题也是直接用真实取消请求测出来的：取消广播确实到达了 tail，
+tail 正确发回 `kBoundaryEnd`，但 entry 收到后只释放了自己的 slot，客户端的 SSE 连接永远挂着，
+什么都不吐）。
+
+**验证（真实模型、真实 Metal 计算、真实两进程）**：同一个 prompt，两节点 split 的输出和真实单节点
+参考**字节级一致**（"We need to respond to"，5 个 token，`finish_reason:length`）；紧接着发起的
+第二个请求正常完成，证明 tail 的 slot 被正确释放；对一个 `max_new:200` 的请求在解码中途发起取消，
+客户端收到干净的 `error{code:cancelled}`，之后两节点都还能正常服务下一个请求。既有的两套假 compute
+测试（`tools/test_boundary_wire.cpp` 195 项、`tools/test_tier1_concurrency.cpp` 64 项）重新跑，
+全过，不受这轮改动影响。
+
+`STRATA_DEBUG_STAGE_WIRE`（`stage_worker.hpp` 的逐帧 SEND/RECV/DROPPED 打印）是这轮调试新加的钩子，
+默认关闭，和 `TECTONIC_DEBUG_COMPUTE`／`TECTONIC_DEBUG_BUFFERS`／`TECTONIC_DEBUG_ZERO_KV` 一样留给
+以后类似问题用，不是一次性代码。
+
 ## 维护规则
 
 1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。哪怕代码要贴着引擎写，
