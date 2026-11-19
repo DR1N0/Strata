@@ -36,7 +36,7 @@
 namespace strata::core {
 
 inline constexpr uint32_t kBoundaryMagic = 0x31544354u;   // "TCT1"
-/// 4: the header is a fixed 58 bytes (`<IHHHQQqqqq`) and the token count IS `rows`.  A decode window's rows
+/// 5: the header is a fixed 66 bytes (`<IHHHQQQqqqq`) and the token count IS `rows`.  A decode window's rows
 /// are <= 16, a prompt chunk's are hundreds, a Request's are the whole prompt - and in every one of them
 /// there is exactly one token per row.  Keeping the count implicit is what lets a reader with no tensor table
 /// (an orchestrator that only sends prompts and prints tokens) parse a frame with a fixed-offset struct.
@@ -48,7 +48,17 @@ inline constexpr uint32_t kBoundaryMagic = 0x31544354u;   // "TCT1"
 /// 0004, and the wire-v4 ADR this bump belongs to) needs more than one, so the wire needed an identity field
 /// before anything built on top of it could multiplex correctly. This is a breaking change on purpose - a v3
 /// reader must refuse a v4 frame outright, not misread 8 extra bytes as something else.
-inline constexpr uint16_t kBoundaryVersion = 4;
+///
+/// 4 -> 5 (Tectonic, mesh-forwarding design decision): added `session_id` (see BoundaryFrame::session_id
+/// below). Routing a request to a path is a session-level decision (ADR 0006's "会话 key → 路径" table,
+/// which changes only when a conversation first routes or its path fails over), not a request-level one -
+/// `request_id` is minted fresh per turn and is the wrong granularity for a future relay to key a
+/// multi-replica forwarding choice on. No code reads this field yet (today's single-runner-per-stage MVP has
+/// exactly one possible destination, so there is nothing to choose between); it is added now, while zero v4
+/// frames exist in any real deployment, because retrofitting a wire-format field later - once real traffic
+/// depends on the byte layout - costs far more than reserving the slot now. Same breaking-change rule as the
+/// 3->4 bump: a v4 reader must refuse a v5 frame, not misread the shifted offsets.
+inline constexpr uint16_t kBoundaryVersion = 5;
 
 /// Rows a decode window can hold: the default length of `next_token`.
 inline constexpr int kBoundaryMaxRows = 16;
@@ -109,6 +119,12 @@ struct BoundaryFrame {
     /// not a sentinel for "none" - see stage_worker.hpp's per-request map for how a single-request caller
     /// degrades correctly without ever assigning one.
     uint64_t request_id = 0;
+    /// Which conversation/session this request belongs to - a routing-granularity identity, not a
+    /// per-request one (see kBoundaryVersion's 4->5 note above): stable across every request_id in the same
+    /// conversation, unlike request_id itself which is fresh per turn. No stage reads or acts on this today;
+    /// it rides along unchanged, the same pass-through rule as request_id. A frame built without ever setting
+    /// this is session_id 0, not a sentinel for "none" - same convention as request_id's own default.
+    uint64_t session_id = 0;
     int64_t pos0 = 0;                 ///< the absolute position of row 0 (a Request: max_new)
     int64_t rows = 0;                 ///< T: a decode window, a prompt chunk, or a Request's prompt length
     int64_t layer_begin = 0;          ///< the producing stage's [begin, end)
