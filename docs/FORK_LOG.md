@@ -687,6 +687,40 @@ tail 正确发回 `kBoundaryEnd`，但 entry 收到后只释放了自己的 slot
 默认关闭，和 `TECTONIC_DEBUG_COMPUTE`／`TECTONIC_DEBUG_BUFFERS`／`TECTONIC_DEBUG_ZERO_KV` 一样留给
 以后类似问题用，不是一次性代码。
 
+## 2026-11-20：`entry_bridge.hpp` 最后一个 scope cut——EOS 检测——修好了
+
+`entry_bridge.hpp` 顶部一直记着这条："不做 EOS 检测，只认 `max_new`"。这次会话的真实单机和真实
+两节点测试都直接观察到过这个后果：模型越过 `<|im_end|>` 继续生成。
+
+**这不是一个要从零设计的功能，`--serve` 等模式早就有**：`o.stop_eos`（开关）、`o.eos_ids`
+（默认 `{248044, 248046}`，这个 Qwen 模型的 `<|endoftext|>`/`<|im_end|>`，`--eos-ids` 可覆盖）。
+而且 2026-11-19 那次修"`--tectonic` 没有复用 `--serve` 的 `--tokens` 豁免"的改动里，同一段代码
+（`if (!have_tokens && (o.serve || o.tectonic))`）**已经顺带把 `o.stop_eos = true` 对
+`--tectonic` 也打开了**——真正缺的只是 `stage_worker.hpp` 驱动 `--tectonic` 环路的两处写回合
+（entry 的单 stage 自环、这次会话新加的 split-stage ring-closing）从来没有检查过这两个已经配置
+正确的值，只看 `EntryBridge::record_token` 基于 `max_new` 算出来的 `more`。
+
+**修法**：`EntryBridge` 加一个只读的 `tokens_so_far(wire_id, out)`——EOS 命中时要把"目前为止
+确认过的 token"发给客户端（配 `done`），但不能把 EOS 本身也记进去（和真实 LLM API 一致，停止信号
+不是内容），`record_token` 自己做不到"只读不追加"，需要一个新方法。`stage_worker.hpp` 加
+`StageWorkerIsEOS`（`std::function<bool(int32_t)>`）和 `StageWorkerConfig::is_eos`——和
+`compute`/`reset`/`prefill` 一样的回调注入方式，保持这个文件"不认识任何模型"的既有设计不变
+（空值＝不检测，向后兼容，`tools/test_tier1_concurrency.cpp` 这类假 compute 测试完全不用改）。
+两处写回合分支里，拿到 `sampled` 之后、调用 `record_token` 之前，先查 `c.is_eos(sampled)`：
+命中就跳过 `control_send_delta`/`record_token`，改用 `tokens_so_far` 取当前完成内容，走和
+`max_new` 到顶一模一样的 `done`/release 路径（split 分支原有的"告知下游 `kBoundaryEnd` 释放
+slot"这一步也原样保留，没有重复实现）。`generate.cpp` 只加一行：把已经解析好的
+`o.eos_ids`/`o.stop_eos` 接成这个回调。**不新增 wire 字段、不新增 CLI flag、Tectonic/Go 一侧
+零改动**——`internal/node/generate.go` 判断 `finish_reason` 的 `len(tokens) < maxNew ⇒ "stop"`
+逻辑本来就是对的，只是从来没有被真正触发过。
+
+**验证（真实模型，真实 Metal 计算）**：单节点和真实两节点 split 部署对同一个"数一到五"请求跑出
+字节级一致的结果——63 个 token，`finish_reason:"stop"`，`<|im_end|>` 本身不出现在回复文本里，
+不是撑到 `max_new:200` 才停；紧接着发起的第二个请求正常完成，确认 EOS 提前结束时 split 路径
+"告知下游释放 slot"这一步没有被跳过。`tools/test_boundary_wire.cpp`（195 项）、
+`tools/test_tier1_concurrency.cpp`（64 项）重新编译跑过，不受影响——两者都不传 `is_eos`，
+走的正是"空值＝不检测"这条向后兼容路径。
+
 ## 维护规则
 
 1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。哪怕代码要贴着引擎写，

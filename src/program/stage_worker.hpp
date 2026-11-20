@@ -24,6 +24,10 @@
 #include <vector>
 
 namespace strata::program {
+// True if a sampled token ends generation on its own - model knowledge this file otherwise has none
+// of (see the header comment above). See StageWorkerConfig::is_eos.
+using StageWorkerIsEOS = std::function<bool(int32_t token)>;
+
 struct StageWorkerConfig {
     std::string worker_data_endpoint;    // Tectonic: was `agent`; the daemon's data connection, HOST:PORT
     // Tectonic: the signal connection (cancel/shutdown) and the hello handshake on both connections are
@@ -48,6 +52,12 @@ struct StageWorkerConfig {
     // default) for every non-entry stage, and for an entry stage that has not been told to speak
     // gen/delta/done (today's real engine's current callers never set this).
     core::EntryBridge* entry_bridge = nullptr;
+    // is_eos: true if a sampled token ends generation on its own, model knowledge this loop otherwise
+    // has none of (see this struct's own "model-agnostic by design" framing above). Null (the default)
+    // means no EOS checking - entry_bridge.hpp's ring-closing paths then stop only at max_new or
+    // cancellation, same as before this existed. generate.cpp wires its own --eos-ids/--stop-eos
+    // options into this without stage_worker.hpp ever learning what a token means.
+    StageWorkerIsEOS is_eos;
 };
 // Per-stage accounting for the whole session. The agent reads request k's own cost from the difference between
 // rows k and k-1.
@@ -672,9 +682,19 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 err = "worker: entry bridge lost request_id " + std::to_string(in.request_id);
                 return false;
             }
+            // An EOS token is a control signal, not content: it is never reported as a delta or kept in
+            // the completion (same as a real model-serving API) - peek the completion instead of
+            // recording this token into it, and stop the same way max_new's own "!more" already does.
+            const bool eos = c.is_eos && c.is_eos(sampled);
             std::vector<int32_t> tokens_so_far;
-            const bool more = c.entry_bridge->record_token(in.request_id, sampled, tokens_so_far);
-            if (!control_send_delta(link, tectonic_id, sampled, err)) return false;
+            bool more;
+            if (eos) {
+                c.entry_bridge->tokens_so_far(in.request_id, tokens_so_far);
+                more = false;
+            } else {
+                more = c.entry_bridge->record_token(in.request_id, sampled, tokens_so_far);
+                if (!control_send_delta(link, tectonic_id, sampled, err)) return false;
+            }
             if (!more) {
                 if (!control_send_done(link, tectonic_id, tokens_so_far, err)) return false;
                 c.entry_bridge->release(in.request_id);
@@ -733,9 +753,17 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 err = "worker: entry bridge lost request_id " + std::to_string(in.request_id);
                 return false;
             }
+            // See the split-stage ring-closing branch above for why EOS skips record_token/delta.
+            const bool eos = c.is_eos && c.is_eos(sampled);
             std::vector<int32_t> tokens_so_far;
-            const bool more = c.entry_bridge->record_token(in.request_id, sampled, tokens_so_far);
-            if (!control_send_delta(link, tectonic_id, sampled, err)) return false;
+            bool more;
+            if (eos) {
+                c.entry_bridge->tokens_so_far(in.request_id, tokens_so_far);
+                more = false;
+            } else {
+                more = c.entry_bridge->record_token(in.request_id, sampled, tokens_so_far);
+                if (!control_send_delta(link, tectonic_id, sampled, err)) return false;
+            }
             if (!more) {
                 if (!control_send_done(link, tectonic_id, tokens_so_far, err)) return false;
                 c.entry_bridge->release(in.request_id);

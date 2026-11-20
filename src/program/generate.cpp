@@ -21962,6 +21962,13 @@ int main(int argc, char** argv) {
         // end to end, not by code review.
         strata::core::EntryBridge entry_bridge;
         if (o.layer_begin == 0) wc.entry_bridge = &entry_bridge;
+        // o.eos_ids/o.stop_eos already exist for --serve and are already force-enabled for --tectonic
+        // (the --tokens exemption above) - this is the only place that was missing: wiring them into
+        // the loop that actually drives --tectonic's own decode, which until now only ever stopped at
+        // max_new or cancellation.
+        wc.is_eos = [&](int32_t token) -> bool {
+            return o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) token) != o.eos_ids.end();
+        };
         ok = strata::program::stage_worker_run(wc, compute_stage, reset_stage, prefill_stage,
                                                &worker_stats, err);
         if (!ok) std::fprintf(stderr, "stage: %s\n", err.c_str());

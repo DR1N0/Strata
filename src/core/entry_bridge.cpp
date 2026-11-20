@@ -38,6 +38,17 @@ bool EntryBridge::record_token(uint64_t wire_id, int32_t token, std::vector<int3
     return (int) it->second.tokens.size() < it->second.max_new;
 }
 
+bool EntryBridge::tokens_so_far(uint64_t wire_id, std::vector<int32_t>& out) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = entries_.find(wire_id);
+    if (it == entries_.end()) {
+        out.clear();
+        return false;
+    }
+    out = it->second.tokens;
+    return true;
+}
+
 void EntryBridge::release(uint64_t wire_id) {
     std::lock_guard<std::mutex> lock(mu_);
     entries_.erase(wire_id);

@@ -12,22 +12,11 @@
 // 2026-11-19 section for the real-code evidence that this is separable from Verifier::run_slot_rows'
 // kernel-level batching (S > 1 in one call), which stays out of scope (ADR 0005's Tier 2).
 //
-// ONE SCOPE CUT REMAINS, FLAGGED HERE RATHER THAN SILENTLY ASSUMED:
-//
-// This bridge drives decode continuation, counted by `max_new`, for both a single-stage deployment (its own
-// self-loop, stage_worker.hpp's `out.n_tensors == 0 && c.lo == 0` check) and a split one (a ring-closing
-// frame back from the real last stage, told apart by `in.layer_begin > 0` - a locally-synthesized admission
-// frame never sets it). Neither path detects EOS: the old Python daemon prototype's echo loop used to decide
-// "stop sampling" by comparing the sampled token against a model's EOS id, which this bridge has no way to
-// know (stage_worker.hpp is model-agnostic by design - see its own header comment). Until an EOS id (or an
-// EOS flag on BoundaryFrame/the compute callback's output) is threaded down to this layer, a request only
-// ever ends by reaching `max_new` or being cancelled. Real generation will run past the point a real model
-// would have stopped itself; this is wrong for production text quality, not for the wire mechanics this
-// round is about.
-//
-// This is independent of the request_id plumbing (wire v4) and the slot-indexed scheduling (the ADR 0005
-// addendum) themselves, which are unconditionally correct and usable by a future, more complete bridge
-// without further changes to boundary_wire.hpp or stage_worker.hpp's per-slot state.
+// EOS detection (the scope cut this comment used to flag) is fixed: both ring-closing paths now check
+// stage_worker.hpp's is_eos callback before record_token, so a real model stops where it actually would,
+// not just at max_new or cancellation - see stage_worker.hpp and generate.cpp's wc.is_eos for the
+// model's own --eos-ids/--stop-eos options reaching this layer without stage_worker.hpp itself having to
+// know what a token means.
 #pragma once
 
 #include <cstddef>
@@ -55,6 +44,11 @@ public:
     /// (the caller must then send `done` and call release() - see the EOS scope cut above for what this
     /// does NOT detect).
     bool record_token(uint64_t wire_id, int32_t token, std::vector<int32_t>& tokens_so_far);
+
+    /// Peeks the completion so far without recording a new token - for a sampled token that must never
+    /// appear in the reported completion itself (EOS - see stage_worker.hpp's is_eos). False if not
+    /// found, `out` cleared.
+    bool tokens_so_far(uint64_t wire_id, std::vector<int32_t>& out) const;
 
     /// Forgets `wire_id`. A no-op if it is not present (release() racing a second release, or a cancel
     /// that already released it, must not be an error).
