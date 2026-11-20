@@ -21747,11 +21747,22 @@ int main(int argc, char** argv) {
         // disappear; the wire wants frames small enough for the peer to buffer. So a 2048-row chunk is cut into
         // 512-row frames on the way out.
         //
-        // A split stage is the one exception: the Metal window (metal/src/engine/stage.h, StagePlan::window)
-        // refuses more than one row per call once a stage owns less than the whole model. Chunk size must
-        // drop to 1 there, trading the amortization win above for being able to run at all.
+        // A split stage is the one exception, and only on Metal: its window (metal/src/engine/stage.h,
+        // StagePlan::window) refuses more than one row per call once a stage owns less than the whole model.
+        // Chunk size drops to 1 there, trading the amortization win above for being able to run at all.
+        //
+        // That limit is Metal's, not the split contract's, so it must not be applied to the other backends.
+        // HIP/CUDA's Prefill hands a chunk's rows over in one copy of T * D floats (src/prefill/prefill.cpp's
+        // hand_in_ memcpy), so a split stage there carries the whole prompt in one chunk. Applying Metal's 1
+        // instead costs one full Prefill call AND one wire round trip per position: measured on a 55-token
+        // prompt across a HIP entry/tail pair, 54 chunk-1 frames made the prompt take 26 s of wall clock
+        // almost entirely in net_recv, where one 54-row chunk is a single exchange.
         const bool stage_is_split = o.layer_begin > 0 || o.layer_end < g.n_layers;
+#if defined(STRATA_GPU_METAL)
         const int64_t stage_chunk = stage_is_split ? 1 : 2048;
+#else
+        const int64_t stage_chunk = 2048;
+#endif
         const int64_t stage_frame_rows = 512;
         // ONE shared Prefill, bound to `ss` only - NOT one per slot (an earlier version of this change tried
         // that; it was wrong, found by actually running real decode compute, not by review). The Metal
