@@ -721,6 +721,31 @@ slot"这一步也原样保留，没有重复实现）。`generate.cpp` 只加一
 `tools/test_tier1_concurrency.cpp`（64 项）重新编译跑过，不受影响——两者都不传 `is_eos`，
 走的正是"空值＝不检测"这条向后兼容路径。
 
+## 2026-11-21：HIP 构建第一次真的编译链接过——PC 侧 agent 发现并修好两个 Metal-only 真问题
+
+这次会话里全部真实模型证据都来自 Mac Metal；`--tectonic` 这条路径（entry_bridge、Tier 1.5）
+从没在 HIP/CUDA 上构建过。PC 这台机器局域网可达之后，PC 侧的 agent（经 lanlobby `dev` 房间协调，
+本仓库 Mac 侧 agent review）第一次尝试在真实 HIP 环境编译，直接编译链接不过，发现两个真问题
+（commit `61e44af72`，Mac 侧 review 后 fast-forward 合并，不是 cherry-pick）：
+
+1. `cmake/strata_gpu_engine.cmake` 的 `strata_engine` 源文件列表从来没有
+   `src/core/entry_bridge.cpp`——和 ROADMAP.md 早就记录过的"`metal/CMakeLists.txt` 漏
+   `entry_bridge.cpp`"是同一类问题的另一半，当时只补了 Metal 那一侧。
+2. `compute_stage` 的 Tier 1.5 `!primed` 分支调用 `metal_engine::window_slot_copy_main`
+   没有套 `#if defined(STRATA_GPU_METAL)`——这个文件里其他每一处 `metal_engine::` 调用都有
+   这层保护，这一处是 Tier 1.5 加进来的时候漏的。HIP/CUDA 没有等价的"把 solo 状态拷进 batch
+   slot"机制，这次修法是 `#else` 分支下让 `primed` 永远不置 true，每一步都走 solo 路径——配合
+   新加的 `--tectonic` 启动校验（非 Metal 下 `--batch > 1` 直接报错退出），论证是：隔离靠的是
+   `batch=1` 这个前提（这个前提下 `admit` 的 `max_in_flight=1`，`ss` 整个生命周期只属于一个
+   请求），放弃的是 Tier 1.5 的交错，不是正确性；这个 gate 等 HIP/CUDA 有自己的 admission copy
+   时才该拆，不是删掉检查。
+
+**证据边界明确分两段，不要混用**：PC 侧验证到的是"编译链接通过、`strata --version` 正常、
+`--gpu 1` 真的选中了 RX 9070"——没有真实模型验证。Mac 侧只验证了"这个改动没有影响 Metal 的
+构建和既有的两套假 compute 测试（195+64 项）"。两段都重要但都不是真实 HIP 模型推理证据，等资产
+（`native-pack-v_q0u84a`，通过 LocalSend 直传，不走网络服务）就位、PC 真的跑通一次 `--tectonic
+--batch 1` 单节点请求之后再补。
+
 ## 维护规则
 
 1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。哪怕代码要贴着引擎写，
