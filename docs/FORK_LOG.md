@@ -746,6 +746,33 @@ slot"这一步也原样保留，没有重复实现）。`generate.cpp` 只加一
 （`native-pack-v_q0u84a`，通过 LocalSend 直传，不走网络服务）就位、PC 真的跑通一次 `--tectonic
 --batch 1` 单节点请求之后再补。
 
+## 2026-11-21（续）：真实 HIP 两段 split 通过，和 Metal 参考字节级一致；顺带修第三个 Metal-only 真问题
+
+资产（`native-pack-v_q0u84a`）到位后，PC 这台机器 31GB RAM + 16GB VRAM 装不下完整 48 层
+（~75GB），**没有单节点这条路可走，只能直接切分验证**——这本身就是真实异构双机场景要解决的问题，
+不是退而求其次。PC 用同机两个 HIP 进程（entry [0,24)、tail [24,48)）先跑通，结果：真实 prompt
+"Say hello in exactly three words"，61 个 prompt token 一个 chunk，`finish_reason:"stop"`，
+最终答案"Hello there friend"——和 ROADMAP.md 记录的 Metal 参考**字节级一致**；紧接着问
+"17+25"答对 42，确认 tail 的常驻 slot 在上一个请求结束后被正确释放，没有读到残留状态。
+
+**跑通过程中又发现一个同一类的真问题**（commit `dbe34fb9f`，在上面的 CMake/primed 修复之上）：
+`generate.cpp` 里 `stage_chunk = stage_is_split ? 1 : 2048` 这一行没有 `#if defined
+(STRATA_GPU_METAL)` 保护——这个 `1` 是 Metal 的 `StagePlan::window`（`metal/src/engine/stage.h`）
+"split stage 每次调用最多一行"这个限制专属的代价，不是"split"这个概念本身要求的。HIP/CUDA 的
+`Prefill` 是一次性把一个 chunk 的所有行拷进 `hand_in_`（`src/prefill/prefill.cpp`），一个 split
+stage 完全可以一次扛住整个 prompt。错把 Metal 的 1 用到 HIP 上，代价是真实测出来的：55-token
+的 prompt 被拆成 54 个"每次 1 行"的帧，54 次 `Prefill` 调用加 54 次 wire 往返，墙钟 26 秒几乎全
+耗在 `net_recv` 上；改成一次 54 行的单个 chunk 后是一次交换。修法是把这一行也套进
+`#if defined(STRATA_GPU_METAL) ... #else const int64_t stage_chunk = 2048; #endif`——这正是
+这次会话早些时候做 Metal split-stage 修复时留下的一个待确认项（"这个值是否还必要，要不要重新
+评估"），现在有了真实跨后端证据，答案是：这一行从一开始就该分后端，之前只在 Metal 上测试过，
+从没有机会发现它被错误地当成了通用规则。
+
+**证据边界**：这是**同一台机器上两个 HIP 进程**，不是真实跨机——真正的 Mac↔PC 跨机 mesh 链路
+（entry 拨号连真实的另一台机器）还没跑。Mac 侧确认了这个改动完全不影响 Metal：重新编译、两套
+既有单测（195+64 项）不受影响，真实两节点 Metal 请求（同一个"数一到五"prompt，63 token，
+`finish_reason:"stop"`，14 秒）结果和改动前**字节级一致**。
+
 ## 维护规则
 
 1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。哪怕代码要贴着引擎写，
