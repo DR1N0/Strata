@@ -21652,6 +21652,18 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "stage: explicit stage range required (--layers); local multi-GPU not supported\n");
             return 2;
         }
+#if !defined(STRATA_GPU_METAL)
+        // A batch slot needs its own running state and K/V before run_slot_rows can name it, and the only
+        // admission copy wired into this branch is Metal's window_slot_copy_main. Refusing here keeps --batch>1
+        // from reaching a slot that no one filled - see the compute_stage `!primed` branch for what the
+        // single-slot path does instead. This is a gate that lifts when the HIP/CUDA copy exists, not a
+        // permanent shape of the contract.
+        if (o.batch > 1) {
+            std::fprintf(stderr, "stage: --tectonic supports --batch 1 on this backend; a batch slot's own "
+                                 "state copy is Metal-only so far\n");
+            return 2;
+        }
+#endif
         // Tectonic (ADR 0005 addendum, "Tier 1.5"): n_slots independently resident SessionStates, one per
         // stage_worker_run slot (see its StageWorkerCompute/Reset/Prefill comments) - slot 0 reuses `ss`,
         // the session the shared setup above already carved for this stage's layer range; slots 1..n_slots-1
@@ -21904,12 +21916,24 @@ int main(int argc, char** argv) {
                     if (re.empty()) re = "stage: expert worker failed"; return false;
                 }
                 if (!stage_ver.commit(1, re)) return false;
+#if defined(STRATA_GPU_METAL)
                 if (!strata::metal_engine::window_slot_copy_main(/*into_slot=*/true, slot, pos + 1,
                                                                  /*kv_only=*/false, re)) {
                     if (re.empty()) re = "stage: copying solo state into the batch slot failed";
                     return false;
                 }
                 if ((size_t) slot < slot_primed.size()) slot_primed[(size_t) slot] = true;
+#else
+                // HIP/CUDA: there is no Metal window buffer to copy a solo run's state into, and no
+                // conversation_checkpoint_copy/conversation_kv_copy admission copy is wired up here yet. So
+                // `primed` deliberately stays false and every position of this stage runs solo, against the
+                // one session the request actually owns: with a single slot stage_worker_run serves one
+                // request at a time, reset_stage zeroes that session between requests, and running solo is
+                // then the same computation against the same buffers, not a shortcut around one. What it does
+                // give up is Tier 1.5's interleaving, which needs the slot copy; --batch>1 is refused at
+                // startup (see the --tectonic block) rather than reaching run_slot_rows against a slot no one
+                // filled - the silent-wrong-answer class of bug the Metal comment above describes.
+#endif
             } else {
                 const int rows[1] = {slot};
                 const int32_t toks1[1] = {token};
