@@ -773,6 +773,56 @@ stage 完全可以一次扛住整个 prompt。错把 Metal 的 1 用到 HIP 上�
 既有单测（195+64 项）不受影响，真实两节点 Metal 请求（同一个"数一到五"prompt，63 token，
 `finish_reason:"stop"`，14 秒）结果和改动前**字节级一致**。
 
+## 2026-11-21（续二）：真实跨机异构双机推理跑通，Metal entry + HIP tail
+
+上一节明确留下的空白——"真正的 Mac↔PC 跨机 mesh 链路还没跑"——这次补上了。Tectonic HEAD
+`6a19335`，Strata fork HEAD `73b34bd98`（Mac／PC 用同一份源码各自本机构建，PC 二进制构建于
+11-21 00:35，对应代码等价于 `73b34bd98`，经确认 `73b34bd98` 相对 `dbe34fb9f` 只改了
+`docs/FORK_LOG.md` 一个文件）。拓扑：Mac（M3 Max，Metal）跑 entry stage `[0,24)`，PC
+（Windows x64，RX 9070 16GB VRAM／gfx1201，HIP，31GB RAM 只剩 14.5GB 空闲，`--mmap-experts`
+磁盘流式 + expert cache 1600 slots＝3.47GiB VRAM）跑 tail stage `[24,48)`；`tectonic` 网关跑在
+PC 本机 `127.0.0.1:7800`，走 `cluster.cross.json`：mac 节点 control
+`http://192.168.1.6:7802`、`worker_data`/`worker_signal` 7103/7104、mesh
+`192.168.1.6:5003`/signal 5004（entry 不监听，这两个字段只是 `cluster.Compile` 要求非空的
+占位）；pc 节点 control `http://127.0.0.1:7801`、`worker_data`/`worker_signal` 7101/7102、
+mesh `192.168.1.7:5001`/`5002`。走的是 `tectonic` 网关的 `POST /v1/chat/completions`
+（OpenAI 兼容端点，两次都是默认非流式），不是直接打 `/generate`。
+
+两个连续真实请求，均走完整链路（gateway → Mac entry `/generate` → Mac 引擎 Metal 计算 →
+mesh → PC tail HIP 计算 → mesh 回传 → Mac 引擎采样聚合 → SSE 回 gateway）：
+"Say hello in exactly three words" → `finish_reason:"stop"`，103 token，12.0 秒，最终答案
+"Hello there friend"——和已归档的 Mac 单机 Metal 参考（`DUAL_MACHINE_L0_20261113.md`）一致；
+"17+25" → `finish_reason:"stop"`，26 token，5.6 秒，推理过程正确算出 42。第二个请求正常完成，
+证明 tail 的常驻 slot 在第一个请求结束后被正确释放，没有读到残留状态。**这是 Tectonic 侧
+R3/R4 mesh 转发证据（2026-11-19）明确记录的空白——"同一台机器上两个进程，不是真实异构
+双机"——第一次被真实补上**；也是上一节 HIP 两段 split 的直接延续——上一节验证的是"同机两个
+HIP 进程"，这次验证的是"两台物理机、两种不同 GPU 后端，真正各自只有半份权重"。
+
+**一个有意思的性能数据**：同一个 61-prompt-token 的"Say hello"请求，跨机是 103 token/12.0 秒，
+而同机 PC 双 HIP 进程对比基准（见上一节）是 124 token/15.8 秒跑到真实 EOS——跨机反而更快，
+因为 Mac 的 Metal prefill 比 PC 的 HIP + 磁盘流式专家快得多，这个差值盖过了局域网往返的额外
+开销。说明"把较慢的机器放在 entry 位置"这个配置方向本身是可行的，不是网络开销必然拖累整体
+延迟。
+
+**两条运维发现，和具体这次修复无关，但下次排障大概率会再撞上，记在这里**：
+(a) mesh 的"只 accept 一次"设计有连锁反应——entry 侧任何原因导致的重新拨号，都要求对端
+tail **人工重启**才能再次 accept；更容易误导人的是，此时 tail 的 `worker.state` 字段仍然
+显示 `ready`，看状态字段完全看不出 mesh 监听已经失效，只有 `netstat`／`lsof` 能看到
+`5001`/`5002` 已经不在 LISTEN。(b) 不要用端口探测（`nc`、`Test-NetConnection`）验证 mesh
+是否可达——探测本身会把这唯一的 accept 名额用掉，之后真正的 entry 拨号会 i/o timeout，而
+探测自己会返回"连通"。这两条是同一个设计（只支持一条连接、接受后立刻停止监听）的两个面向，
+在当前 MVP 拓扑下都不是 bug，但这次排障两条都被踩了一遍，连带现象容易让人怀疑错方向
+（防火墙／网络层），值得在 `mesh.md` 里单独留一节操作注意事项。
+
+**证据边界**：只测了两个独立的单轮非流式请求，**没有测取消、没有测多轮续算、没有测
+`stream:true`、没有测并发**——不要把同机 R4 那几轮（流式／取消／多轮／并发）的结论搬到这里，
+这次只证明了"真实跨机、真实异构后端、单轮请求端到端正确"。另外这次 Mac 一侧的控制端口因为
+托管 Mac 的应用防火墙从未给 Go 二进制弹出过放行对话框，临时挂了一个本地 Python 裸字节 TCP
+转发代理（`tectonicd` 真实只绑 `127.0.0.1`，代理绑 `0.0.0.0:7802` 转发到它）才打通——这是
+这次会话里的调试辅助手段，不在任何仓库的产品代码路径里，往后需要时应在 Tectonic
+`docs/design/` 里单独评估"节点间控制面是否需要官方代理/反向隧道能力"，而不是默认依赖这种
+本机手搭的绕过。
+
 ## 维护规则
 
 1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。哪怕代码要贴着引擎写，
