@@ -860,9 +860,30 @@ data link 上可能还有其他请求（Tier 1.5 多 slot）在途，关掉或�
 ROADMAP 记录的基线数）全过；真实 Metal `strata` 二进制（`ninja -C
 /tmp/strata-build-metal strata`）重新编译链接成功，无新增警告。
 
-**证据边界**：这次只有 CPU-only 假 compute 测试和真实 Metal 二进制的编译验证，**没有**真实
-跨机重新跑一遍显式取消场景——PC 已经就位、随时可以配合重新验证，但这次改动提交时那一步
-还没完成，ROADMAP 里"跨机取消"的状态要等这一步真实验证回来才能从"部分通过"升级。
+**真实跨机验证已补上（同日）**：commit `2fa35047c` 分别在 Mac（Metal，`ninja -C
+build-tectonic-test strata`）和 PC（HIP，`build-hip-win/strata.exe`，版本号仍是
+`strata 0.1.61`）重新编译，真实两机重新部署后，三条取消路径全部验证通过（PC tail 侧日志
+原文）：(1) 显式 `/cancel` 落在 prefill 期间——走已有的按帧检查分支，
+`worker: cancelled request 1 at position 64`，后续请求 6.7 秒正常完成；(2) 显式
+`/cancel` 落在 decode 中途且上游已经停止发帧——走这次新加的 `drain_cancelled_slots`
+分支，`worker: cancelled request 3 while idle (no further frame was coming)`，
+后续请求 4.0 秒正常完成，这条是这次修复专门要解决的场景，日志证实走的正是新分支而不是
+侥幸撞上旧的按帧检查；(3) 客户端直接断开（收 5 个 chunk 后 close，不显式调用 `/cancel`）——
+`worker: cancelled request 5 at position 68`，后续请求 6.0 秒正常完成。整轮验证日志里
+`no free slot` 只出现过一次且是修复前的旧记录，三条路径验证完一次都没有再出现。
+ROADMAP 里"跨机取消"从"部分通过"升级为"通过"。
+
+**证据链可信度说明**：这轮验证的 `/worker/start` 全部由 PC 侧对 Mac 发起远程 HTTP 调用，
+不经过 Mac 本机的后台 curl——这次会话里发现 Mac 本机自己发起、重定向到文件的后台
+`curl -X POST` 在某些情况下会被执行环境静默替换成一段类型 schema 占位符而不是真的发出
+请求（`xxd` 核实过是真写进磁盘的字节，不是展示层问题），具体机制不明，但结论是"本机后台
+发起的状态变更请求，返回 2xx 不代表真的执行了"。这轮证据链因为是 PC 远程发起、Mac 侧只是
+被动响应，不受这个问题影响；详见 Tectonic `docs/ROADMAP.md` 对应说明。
+
+另外 PC 这轮顺带踩到第三次"`worker.state: ready` 不代表真的能服务"的实例（前两次是 mesh
+accept-once 相关）：tail 引擎进程刚启动就因为 `stage: boundary: recv failed` 退出，
+daemon 的 `worker.state` 仍报告 `ready`，重启后恢复正常，目前判断偶发、没有稳定复现路径，
+记在 Tectonic `docs/design/mesh.md` 的操作注意事项里。
 
 ## 维护规则
 
