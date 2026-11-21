@@ -175,7 +175,12 @@ void section_a() {
 
     check(reset_calls.load() == 2, "A: reset() called exactly once per request (100 and 200), not per frame");
 
-    // Cancel request 100 via the signal connection; request 200 must be unaffected.
+    // Cancel request 100 via the signal connection; request 200 must be unaffected. No further frame for
+    // 100 is ever sent - a real explicit cancel means the upstream has already stopped sending once it
+    // cancelled on its own side (docs/FORK_LOG.md, 2026-11-21: a tail-side slot found wedged forever by
+    // real cross-machine testing because the old per-position was_cancelled check only ever ran when a
+    // frame for THAT SAME request_id arrived). The idle-wait's own periodic sweep (not a subsequent frame)
+    // must be what closes this out; recv_frame() blocks until it does.
     {
         json cancel;
         cancel["type"] = "cancel";
@@ -189,14 +194,9 @@ void section_a() {
         std::string serr;
         check(signal_conn.send_frame(bytes, serr), "A: cancel sent on signal connection");
     }
-    // Give the signal thread a moment to land the flag before the next position arrives.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    BoundaryFrame req100c;
-    req100c.kind = kBoundaryRows; req100c.request_id = 100; req100c.pos0 = 2; req100c.rows = 1;
-    req100c.next_token = {12};
-    send_frame(req100c);
     BoundaryFrame cancelled = recv_frame();
-    check(cancelled.kind == kBoundaryEnd && cancelled.request_id == 100, "A: request 100 cancelled (kBoundaryEnd, tagged 100)");
+    check(cancelled.kind == kBoundaryEnd && cancelled.request_id == 100,
+          "A: request 100 cancelled with no further frame for it ever sent (kBoundaryEnd, tagged 100)");
 
     // Request 200 keeps going, unaffected by 100's cancellation.
     BoundaryFrame req200b;

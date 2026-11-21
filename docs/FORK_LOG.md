@@ -823,6 +823,47 @@ tail **人工重启**才能再次 accept；更容易误导人的是，此时 tai
 `docs/design/` 里单独评估"节点间控制面是否需要官方代理/反向隧道能力"，而不是默认依赖这种
 本机手搭的绕过。
 
+## 2026-11-21（续三）：显式取消在真实跨机下仍然失败——取消依赖"还有下一帧"，不依赖收到取消本身
+
+上一节的真实跨机里程碑验证完之后，PC 继续测了 Tectonic 侧那次 `handleCancel` 竞态修复
+（`ebdf1bd`）没有覆盖到的另一条路：客户端**显式**调用 `/cancel`（不是断开连接）。结果：
+Mac 的 `/cancel` 返回 202，tail 侧的 `acceptMeshSignal` 也确实收到了取消帧
+（`received {Type:cancel RequestID:...}`，`session.Cancel -> nil`），但**没有**出现
+`worker: cancelled request N`这一行——tail 继续往下算，下一个请求直接撞上
+`no free slot for a new request (kBoundaryRequest)`。PC 定位到了具体代码行：
+`stage_worker.hpp` 的 signal 线程收到 `kCancel` 时只是把 `slot_state[...].cancelled`
+原子标志置位，真正"发 `kBoundaryEnd` + 释放 slot"的逻辑在主循环的 `was_cancelled` 分支里，
+而这个分支**只有在这个被取消的 request_id 自己的下一个 position 帧到达时才会被检查**
+（`find_slot(in.request_id)` 用的是这一帧自己携带的 id）。显式取消之后，上游的 `Gen` 立刻
+返回、不再发送任何帧，这个 request_id 的下一帧永远不会来，标志位永远没人检查。上一节
+（`DUAL_MACHINE`，场景 1：客户端直接断开）之所以能"成功"，纯粹是因为断连发生时 tail
+手上恰好还有别的帧在流转，带着顺便检查到了——这是时序运气，不是这个机制本身可靠。
+
+**修复没有采用"signal 线程直接打断阻塞的 recv"这条路**（PC 提的两个方向之一）：主循环的
+data link 上可能还有其他请求（Tier 1.5 多 slot）在途，关掉或打断这条连接会连累它们，不是
+只影响被取消的那一个。采用的是另一条路——给主循环等待下一帧的地方（`incoming_cv.wait`）
+加一个有限超时（50ms），空闲轮询一次：原来无限期阻塞直到有新帧或连接关闭，现在每 50ms
+醒一次，检查是否有"被标记了取消、但不会再等到下一帧"的 slot，有的话主动按
+`was_cancelled` 分支同样的方式收尾（新增 `drain_cancelled_slots`，复用同一套
+`resolve`/`control_send_error`/`send(kBoundaryEnd)`/`release_slot` 逻辑，发送仍然只发生在
+主线程，不新增跨线程写 `link` 的并发问题）。真实计算路径（`incoming`/`pending` 非空时）完全
+不受影响——这个超时只在真正空闲、等待网络 I/O 时才会触发。
+
+**这次改动顺带暴露了一个既有测试在断言"旧的、有缺陷的行为"**：`tools/test_tier1_concurrency.cpp`
+的 Section A 原来的取消测试会在发出取消后 sleep 100ms、再发一帧触发旧的按帧检查逻辑——
+这正是生产环境里那个"时序运气"场景的测试版本，不是在验证"取消本身可靠"。改动后的空闲轮询
+（每 50ms 一次）会在这 100ms 睡眠期间就把这个 slot 提前收尾掉，导致测试后续发的那一帧撞上
+"a position continues a request this stage never started"，连带两个下游检查失败。
+**这不是回归，是测试假设过时了**：改成直接在发出取消后等 `recv_frame()`，不再发送任何后续帧
+就应该收到 `kBoundaryEnd`——这才是真正要保证的性质（显式取消不需要任何后续帧配合）。改完后
+`tools/test_boundary_wire.cpp`（195 项）、`tools/test_tier1_concurrency.cpp`（64 项，恢复到
+ROADMAP 记录的基线数）全过；真实 Metal `strata` 二进制（`ninja -C
+/tmp/strata-build-metal strata`）重新编译链接成功，无新增警告。
+
+**证据边界**：这次只有 CPU-only 假 compute 测试和真实 Metal 二进制的编译验证，**没有**真实
+跨机重新跑一遍显式取消场景——PC 已经就位、随时可以配合重新验证，但这次改动提交时那一步
+还没完成，ROADMAP 里"跨机取消"的状态要等这一步真实验证回来才能从"部分通过"升级。
+
 ## 维护规则
 
 1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。哪怕代码要贴着引擎写，

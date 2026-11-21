@@ -274,6 +274,51 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         return true;
     };
 
+    // Tectonic (real cross-machine evidence, 2026-11-21): the per-position was_cancelled check below
+    // only ever runs when a frame for THAT SAME request_id arrives - fine for a cancel racing a still-
+    // flowing decode, but an explicit cancel (as opposed to a disconnect this loop's upstream notices on
+    // its own) makes the upstream stop sending entirely, so that frame never comes and the slot stays
+    // held forever (observed: a cancelled request's tail-side slot wedged until a full worker restart,
+    // confirmed via real cross-machine mesh debug logging - see docs/FORK_LOG.md). Called from the main
+    // loop's own idle-wait timeout (not the signal thread - sending stays on this one thread, same as
+    // every other `send`/`control_send_*` call here), it sweeps for slots the signal thread marked
+    // cancelled that a frame will never arrive to close out, and closes them exactly like the
+    // was_cancelled branch does.
+    auto drain_cancelled_slots = [&]() -> bool {
+        std::vector<uint64_t> to_close;
+        {
+            std::lock_guard<std::mutex> lock(state_mu);
+            for (auto& kv : request_slot) {
+                if (slot_state[(size_t) kv.second].cancelled.exchange(false, std::memory_order_relaxed)) {
+                    to_close.push_back(kv.first);
+                }
+            }
+        }
+        for (uint64_t rid : to_close) {
+            std::string tectonic_id;
+            if (c.entry_bridge != nullptr && c.entry_bridge->resolve(rid, tectonic_id)) {
+                if (!control_send_error(link, tectonic_id, "cancelled", "request cancelled", err)) return false;
+                c.entry_bridge->release(rid);
+                std::fprintf(stderr, "worker: cancelled request %llu (%s) while idle (no further frame was coming)\n",
+                             (unsigned long long) rid, tectonic_id.c_str());
+            } else {
+                BoundaryFrame cancel_end;
+                cancel_end.kind = kBoundaryEnd;
+                cancel_end.request_id = rid;
+                cancel_end.rows = 1;
+                cancel_end.pos0 = 0;
+                cancel_end.layer_begin = c.lo;
+                cancel_end.layer_end = c.hi;
+                if (!send(cancel_end)) return false;
+                std::fprintf(stderr, "worker: cancelled request %llu while idle (no further frame was coming)\n",
+                             (unsigned long long) rid);
+            }
+            std::lock_guard<std::mutex> lock(state_mu);
+            release_slot(rid);
+        }
+        return true;
+    };
+
     // Tectonic (ADR 0005 addendum): `link` is now read by its OWN thread, decoupled from the main loop's
     // compute/dispatch. Without this, admitting a new request while another is already resident would be
     // impossible: the old design only ever read the socket when it had nothing else to do, so a slot's own
@@ -439,7 +484,12 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
 
         if (!have_in) {
             std::unique_lock<std::mutex> lock(incoming_mu);
-            incoming_cv.wait(lock, [&] { return !incoming.empty() || reader_done; });
+            // Tectonic: bounded, not indefinite - an explicit cancel can mean no further frame for this
+            // slot is ever coming (see drain_cancelled_slots's own comment), and only a periodic wake-up
+            // gives that case a chance to be noticed and closed out instead of holding its slot forever.
+            const bool woke_for_frame =
+                incoming_cv.wait_for(lock, std::chrono::milliseconds(50),
+                                      [&] { return !incoming.empty() || reader_done; });
             if (incoming.empty() && reader_done) {
                 // A shutdown closes `link` itself to unblock the reader thread's recv_frame, so a
                 // shutdown-caused close is the expected way this function ends, not a transport error.
@@ -451,6 +501,8 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 err = reader_err.empty() ? "worker: data connection closed" : reader_err;
                 return false;
             }
+            lock.unlock();
+            if (!woke_for_frame && !drain_cancelled_slots()) return false;
             continue;   // something is in `incoming` now - the opportunistic check above picks it up
         }
         if (prefill && in.kind == kBoundaryRequest) {
