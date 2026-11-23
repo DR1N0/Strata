@@ -185,6 +185,8 @@ void set_model_shard(const char* shard1);   // metal/src/engine/window.cpp
 void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch slots the window keeps state for
 // batch slot b <-> the main sequence: the running state (unless kv_only) and the first `upto` cells of K/V
 bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err);
+// wipes batch slot b's own stash to all-zero - every cell, not just a prefix (see reset_stage's caller)
+bool window_slot_reset_main(int slot, std::string& err);
 std::string draft_vocab_default();   // metal/src/engine/window.cpp: the packaged default draft subset (data/draft_vocab.bin)
 bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 }
@@ -21819,6 +21821,16 @@ int main(int argc, char** argv) {
             // ONE FRAME PER CHUNK, CUT SMALLER IF NEEDED. Prefill wants chunks big enough that its per-chunk cost
             // disappears; the wire wants frames small enough for the peer to buffer. Those are different limits.
             pf.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                if (std::getenv("TECTONIC_DEBUG_SLOT_COPY")) {
+                    std::vector<float> host((size_t) T * (size_t) stage_hc_n);
+                    if (cudaMemcpy(host.data(), R_rows, host.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                        uint64_t h = 1469598103934665603ull;
+                        const uint8_t* b = (const uint8_t*) host.data();
+                        for (size_t i = 0; i < host.size() * sizeof(float); ++i) { h ^= b[i]; h *= 1099511628211ull; }
+                        std::fprintf(stderr, "DBG entry_handoff: slot=%d p0=%lld T=%lld checksum=%016llx\n",
+                                     slot, (long long) p0, (long long) T, (unsigned long long) h);
+                    }
+                }
                 if (o.layer_end >= g.n_layers) return true;    // the last stage hands rows to nobody
                 for (int64_t at = 0; at < T; at += stage_frame_rows) {
                     const int64_t rows = std::min(stage_frame_rows, T - at);
@@ -21868,12 +21880,24 @@ int main(int argc, char** argv) {
             if (std::getenv("TECTONIC_DEBUG_COMPUTE")) std::fprintf(stderr, "DBG reset_stage: slot=%d\n", slot);
             // Always zeroes the shared solo session (`ss`), not slot_sessions[slot]: prefill and the first
             // decode step always run solo (see prefill_stage/compute_stage) - see this block's declaration
-            // comment on why that is correct, not a shortcut. This slot's OWN buffer is stale until the
-            // next compute_stage call copies fresh state into it, which slot_primed tracks.
+            // comment on why that is correct, not a shortcut.
             strata::core::session_zero(ss, g, nullptr, main_cs);
             if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
                 re = "stage: session reset did not synchronize"; return false;
             }
+#if defined(STRATA_GPU_METAL)
+            // The slot's OWN Metal-window stash (window_slot_copy_main's destination) is NOT covered by the
+            // session_zero above, and the next admission copy only fills [0, this conversation's own length)
+            // - a slot that held a longer, different prior conversation keeps that conversation's K/V past
+            // that point. Found by a controlled A-then-B experiment (a short-prompt A followed by B reusing
+            // A's slot reliably produced repeating garbage; A followed by a long-prompt C whose own prefill
+            // happened to overwrite every cell A had dirtied came out correct). Wipe the whole stash here so
+            // "stale until the next copy" is actually true, not just true for a prefix.
+            if (!strata::metal_engine::window_slot_reset_main(slot, re)) {
+                if (re.empty()) re = "stage: resetting the batch slot's own state failed";
+                return false;
+            }
+#endif
             kvg_start(xcache.slots());
             if ((size_t) slot < slot_primed.size()) slot_primed[(size_t) slot] = false;
             return true;

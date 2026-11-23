@@ -615,5 +615,22 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
         std::fprintf(stderr, "strata metal: prompt %lld tokens in %.1f ms (GPU %.1f ms, host rows %.1f ms [+%.1f ms beside the GPU; embeddings %.1f, PLE %.1f], drafter rows %.1f ms) "
                              "-> %.1f tok/s\n", (long long) n, now_ms() - t0, pb_.gpu_ms, pb_.host_ms, pb_.hidden_ms, pb_.emb_ms, pb_.ple_ms, pb_.mtp_ms,
                      1000.0 * (double) n / (now_ms() - t0));
+    if (std::getenv("TECTONIC_DEBUG_SLOT_COPY")) {
+        size_t jd = 0;
+        for (size_t j = 0; j < kq_.size(); ++j) {
+            bool allz = true;
+            for (size_t k = 0; k < kq_[j].bytes; ++k) if (((const uint8_t*) kq_[j].ptr)[k] != 0) { allz = false; break; }
+            if (!allz) { jd = j; break; }
+        }
+        auto cs = [](const mtl::Buffer& b) { return fnv1a(b.ptr, b.bytes); };
+        std::fprintf(stderr, "DBG prompt_done: jd=%zu gst[jd]=%016llx gh0[jd]=%016llx gh1[jd]=%016llx pleHist=%016llx "
+                     "kq[jd]=%016llx vq[jd]=%016llx ksc[jd]=%016llx vsc[jd]=%016llx pooled[jd]=%016llx "
+                     "tail[jd]=%016llx dead[jd]=%016llx\n",
+                     jd, (unsigned long long) cs(gst_[jd]), (unsigned long long) cs(ghist_[0][jd]),
+                     (unsigned long long) cs(ghist_[1][jd]), (unsigned long long) cs(pleHist_),
+                     (unsigned long long) cs(kq_[jd]), (unsigned long long) cs(vq_[jd]), (unsigned long long) cs(ksc_[jd]),
+                     (unsigned long long) cs(vsc_[jd]), (unsigned long long) cs(pooled_[jd]), (unsigned long long) cs(tail_[jd]),
+                     (unsigned long long) cs(dead_[jd]));
+    }
     return true;
 }

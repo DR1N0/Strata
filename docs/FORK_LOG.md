@@ -885,6 +885,565 @@ accept-once 相关）：tail 引擎进程刚启动就因为 `stage: boundary: re
 daemon 的 `worker.state` 仍报告 `ready`，重启后恢复正常，目前判断偶发、没有稳定复现路径，
 记在 Tectonic `docs/design/mesh.md` 的操作注意事项里。
 
+## 2026-11-22：split-stage 的 T=1 decode 解除限制后，暴露了一个全新的、split 专属的"第二次对话污染"bug——定位到 tail 的 QSA 计算，根因未找到
+
+上一轮（2026-11-19 再续二）修的 `09e21ed13`（`&ss` 被 `init_slots` 重复注册）只覆盖了 Tier 1.5
+本身；这次会话先做的是另一件事——`stage.h`/`window.cpp` 里有一条和 Tier 1.5 无关、更早的限制：
+`StagePlan::window()` 对一个 split 阶段（`lo>0` 或 `hi<n_layers`）无条件拒绝 T=1 decode
+（旧错误信息"metal: L0 supports T=1"），逻辑上属于更早期可行性验证阶段遗留、从未因为 Tier 1.5
+落地而重新评估过。放开之后（`window()` 改成只拒绝 T>1，T=1 一视同仁），紧跟着暴露
+`finish_rows()` 从未实现 `finish()` 已有的 boundary-export 逻辑，一并补上。两处都是真实的
+legacy gap，不是过度放宽——QSA 分组对齐（`qsa_interval`）那条限制经过核实，当前所有配置的切分
+点本来就落在 QSA 组边界上，继续保留，加了注释说明为什么不是同类问题。
+
+这两个修复让 split-stage（entry [0,24) + tail [24,48) 两进程）第一次能跑真实的单次 decode。但
+紧接着的多轮验证（`A` 跑完，同一个长驻 tail 进程上接着跑 `B`，不同 `request_id`）暴露了一个**新
+的、split 专属的 bug**：`B` 的输出变成重复乱码（`[[els_improved]]...` 循环）或替换成一段
+语义连贯但完全无关的文本（某次复现是一个 `<|im_start|>user` + 带 JSON 参数的 tool-call 模板，
+和请求内容毫无关系）——后一种形态直接排除了"纯 GPU 数值噪声"（专家缓存冷热的正常误差只会让
+文字质量有细微差别，不会让模型吐出一段无关但语法完整的文本）。
+
+**已经确认排除的候选（每一条都有真实 Metal 计算证据，不是代码审查猜测）**：
+
+1. **slot 自己的 Metal buffer 残留**（`sets_[b+1]`，PC 最初的假设）：真实存在——A 跑完后
+   `o.kq[6]`（tail 自己拥有的第一个 QSA 层，不是 index 0——见下面"方法论教训"）checksum
+   确认有 A 的真实残留。新增 `Window::slot_reset(b)`（`metal/src/engine/window.cpp`，
+   `generate.cpp` 的 `reset_stage` 里调用）把整个 slot 的 `kq_/vq_/ksc_/vsc_/pooled_/gst_/
+   ghist_/pleHist_/tail_/dead_` 连同 `hp_/pend_fold_/last_T_/last_head_/last_tokens_/
+   ss->ple_prev/ple_token` 全部清零，用 checksum 确认清零真实生效——**但 A-then-B 依然
+   100% 复现同样的乱码**，证明这不是（唯一）根因。
+2. **solo/live session 自己的 K/V 残留**：`TECTONIC_DEBUG_ZERO_KV=1`（连 solo 的 `kq_/vq_/
+   ksc_/vsc_` 一起清零）叠加上面的 `slot_reset`，**依然复现同样的乱码**。
+3. **`bigs_ok_`（`--batch>0` 触发的共享大缓冲切分）本身是嫌疑**：完全不传 `--batch` 时
+   `n_slots` 仍然是 1、`slots_init`/`alloc_set` 仍然跑（只是 `real=false`，各自独立分配而不是
+   `view_of` 切片），`compute_stage` 的 `!primed`/`slot_copy` 逻辑完全一样会走——**bug 在
+   不传 `--batch` 时同样复现**，排除 `bigs_ok_` 路径本身是根因。
+4. **Tectonic(Go)/model-frontend(Python) 拼接了上一个对话**：一度怀疑 tail 的 WDONE 日志
+   `prompt_positions` 字段显示"B 的 prompt 长度 ≈ A 的长度 + B 自己的长度"，像是请求被拼接——
+   核实后这是**误读**：`StageWorkerStats::prompt_positions` 是整个 worker 进程生命周期的
+   **累加计数器**（每个请求 `+=` 自己的长度，从不清零），不是单次请求的长度。派 agent 复核了
+   `internal/node`/`internal/modelfrontend`/`model_frontend` 全链路，确认每个请求都是
+   `RequestID`/`Messages` 现取现渲染现编码，没有按别的 key 缓存或拼接 messages。
+5. **内容是否相同**：怀疑过"A、B 内容不同才会相互干扰"，对照实验发了两个内容完全相同的请求
+   （不同 `request_id`）——**第二个依然坏**，而且两次复现的具体乱码内容不一样，说明不是
+   基于"和上一次是否相同"的逻辑分支，纯粹是"这是不是这个 tail 进程处理的第 N≥2 个对话"。
+
+**目前最精确的隔离结果（真实 checksum，不是猜测）**：
+
+- **完整非 split 单进程**（一个节点跑全部 48 层，不分两进程）上，A-then-B 两次都完全正确
+  （B：`finish_reason` 正常、内容连贯讲雷利散射）。`09e21ed13` 那次修复本身没有回归，bug
+  专属 split-stage 路径，和一般的 Tier 1.5/slot 复用机制无关。
+- entry 发给 tail 的 handoff 张量（`generate.cpp` 的 `pf.on_chunk` 回调里新增的 checksum）：
+  B 单独跑（全新进程）和 B 紧跟 A 之后跑，entry 自己算出的 handoff checksum **字节级完全一致**
+  ——entry 自己的 prefill 复用是干净的，B 到达 tail 时已经是正确的输入。
+- 在 tail 自己的 `Window::prompt_chunk()`（这是真正消费 handoff 的函数——流式加载模式下
+  `Window::prompt()`/`pc_chunk` 那条路根本不会被调用，走的是 `prompt_chunk`/`PromptGemm`）
+  结束时，对同一个 B 请求分别在"B 单独跑"和"B 复用 tail"两种场景下，对 `gst_[jd]`/
+  `ghist_[0][jd]`/`ghist_[1][jd]`/`pleHist_`（`jd` = 自动探测的、tail 真正拥有并写入的
+  第一个 QSA 层序号，对 tail 是 6，不是 0——见下面方法论教训）做 checksum：**完全一致**。
+  但 `kq_[jd]/vq_[jd]/ksc_[jd]/vsc_[jd]/pooled_[jd]/tail_[jd]/dead_[jd]`
+  **全部不同**，即使输入（entry 的 handoff）、GDN 递归状态、PLE 历史都已经证明一致。
+  叠加 `TECTONIC_DEBUG_ZERO_KV` 后 `kq_/vq_/ksc_/vsc_` 的 checksum 确实变了（钩子有效果），
+  但仍然对不上"B 单独跑"的基准值；`pooled_/tail_/dead_` 的 checksum 在有无这个钩子之间
+  **完全不变**，说明它们的计算路径不读 `kq_/vq_` 当时的内容，依赖的是另一处还没定位的状态。
+
+**结论**：根因在 tail 自己的 QSA attention 计算路径里，比目前已覆盖的所有 SeqSet 级缓冲区
+（`kq_/vq_/ksc_/vsc_/pooled_/gst_/ghist_/pleHist_/tail_/dead_`，包括 solo 和 slot 两份）
+更深——可能是 `prompt_chunk` 用到的 `PromptGemm`（`pg_`，懒分配、进程生命周期内复用、从不
+清零的 GPU scratch buffer，参见 `metal/src/engine/window.cpp` 的 `pc_setup`/`p.R`/`p.scores`
+等字段）里某个未被 `T`/`Tn` 正确裁剪、读到了上一个对话残留内容的中间缓冲，也可能是 QSA kernel
+（`metal/kernels/qsa_prompt.metal`、`qsa.metal`）本身某个 host 侧 checksum 看不到的状态。
+截至本条记录，**根因尚未定位**，日志打点已经用到了单条函数级别的粒度，下一步大概率需要
+Metal GPU 层面的缓冲区捕获工具，而不是继续加 `fprintf`。
+
+**方法论教训（本次调查自己踩的坑）**：`kq_`/`o.kq` 等数组按**全局** QSA 层序号排列
+（每 4 层一个 QSA 层，全模型 12 个），但一个 layer-range 切分的 stage 只写自己拥有的那几个
+——tail（layers [24,48)）只写 index 6-11，index 0-5 属于 entry，对 tail 来说永远是零。
+本次调查前半段的 checksum 全部用 index 0 做对比，得到过一个看似"悖论"的结果（同一数组不同
+长度的 FNV-1a(全零字节) 恰好等于观察到的"非零"checksum，用 Python 独立验证过），后来才意识到
+是检查了一个 tail 根本不会写的死 buffer。**下次给一个 layer-range 切分的 stage 做 checksum
+诊断，先自动探测"这个 stage 真正写的是哪个数组下标"，不要默认用 0。**
+
+本条记录涉及的改动（均在 `myrepo`，**均未提交**——调查仍在进行中，按项目惯例等真正修好、
+验证通过后再提交，保持 mock/诊断代码和最终修复分开）：`metal/src/engine/stage.h`、
+`metal/src/engine/window.cpp`（`StagePlan::window`/`finish_rows`/新增 `Window::slot_reset`/
+大量 `TECTONIC_DEBUG_SLOT_COPY` 门控的 checksum 诊断）、`metal/src/engine/prompt_chain.inc`、
+`src/program/generate.cpp`（`reset_stage` 调用 `slot_reset`、`pf.on_chunk` 里的 handoff
+checksum）、`tests/core/test_metal_stage.py`（跟随 `window()` 签名变化更新）。
+
+## 2026-11-22（续）：一度误判为时序竞态，复测后证伪——最终证实是 100% 确定性 bug，当前最强假设是 expert 缓存 hit/miss 两条路径读到不等价数据
+
+继续上一条记录的调查，和 PC（HIP 机器）协作推进，有三个新的、决定性的事实：
+
+**1. 跨后端交叉验证：Metal tail 坏，HIP tail 好。** PC 核实了此前的真实跨机验证记录——Mac
+（Metal）entry + PC（HIP）tail，`--batch` 不传（`o.batch=0, n_slots=1`，和本次复现的配置一致），
+A-then-B 同 slot 复用（`Say hello`→`Hello there friend`，紧接着`17+25`→`42`）、多轮带历史、流式、
+取消，**全部真实验证通过**。也就是说：同一个 entry（Metal）、同样的 split 配置、同样的"顺序复用"
+场景，**tail 换成 HIP 就是对的，tail 是 Metal 就是错的**。bug 范围缩小到 Metal 的
+`prompt_chunk`（`prompt_hand_ != nullptr` 分支，即非 entry 的 split stage）本身。
+
+**2.（已证伪，记录在这里防止下次重复踩）"sleep 修好了" 这个实验结论最初被误判为决定性证据，
+复测后发现不可复现，不能作为判据使用。** PC 提议了一个零代码改动的实验：A 完成和 B 开始之间
+人为插入等待，用"等待能否让 B 变正确"来区分时序竞态和确定性状态残留。**第一次**尝试（sleep 4
+秒）B 确实变成了完全正确、连贯的内容，当时据此判断"这是真实时序竞态"并写进了本文件的上一版。
+**随后为了给 sleep 时长定阈值做了二分**（1 秒、2 秒、3 秒、重新测的 4 秒、10 秒），结果
+**1/2/3/4/10 秒全部复现失败，包括重新测的那个 4 秒**——和第一次 4 秒成功的结果直接矛盾。
+这意味着第一次的"成功"大概率是偶发（环境噪声、文件系统缓存热度，或调查期间穿插的重新编译带来
+的某种无关副作用），不是 sleep 时长本身的确定性效果。**结论：没有证据表明单纯等待能让 B 变
+正确；"是时序竞态还是确定性残留"这个问题重新回到未决状态。** 这个教训本身值得记下来：一次性的
+成功实验，在下结论、尤其是据此排除其他方向之前，必须先验证可复现，否则很容易把噪声误判成
+信号，带着后续所有推理一起跑偏。
+
+**3. 怀疑的具体机制（expert 异步预取）用自己的诊断证伪了，但当时这条诊断是在"已经认定时序竞态
+为真"的前提下做的，前提本身不可靠，所以这条证伪的分量也要打折扣，仅供参考。** 原怀疑方向是
+`ExpertStream::at_layer`
+（`metal/src/engine/stream.cpp:620`）：prompt 模式下每层会为"下一层"无条件触发异步预取
+（`submit(..., urgent=false)`，不等待），A 处理到最后几层时也会这样做。新增
+`TECTONIC_DEBUG_STREAM` 诊断（`at_layer` 入口打印 `pre_q_`/`urgent_q_` 长度、`outstanding_`
+计数、队列里每个 job 的 `layer` 字段），对比 A 结束时刻与 B 开始时刻的队列状态：**B 的第一次
+`at_layer(l=24)` 调用时 `pre_q_.size=0`、`outstanding_=0`，完全干净，没有任何 A 遗留的 job**；
+紧接着 `l=25` 的 1000+ 条队列项全部标注着 `layer=25`，是 B 自己为下一层触发的正常预取，不是
+A 的残留。这**直接证伪**了"A 的后台预取 job 还排队、和 B 的 at_layer 抢占同一份状态"这个最直接
+的假说。另外确认了 `ExpertStream` 本身有看似完整的跨请求 drain 机制
+（`hold_region(true)`→`done_cv_.wait(outstanding_==0)`，由 `Window::prompt_region(true)`
+在**每次**（不是只有第一次）`prompt_chunk` 循环开始前调用），`run_graph_seg`
+（`metal/src/mtl_rt.mm:379`）的 GPU/CPU 握手（共享 `MTLSharedEvent`，host 忙等信号→调
+`at_cut`→推进事件值放行 GPU 下一段）在静态审查下也没发现明显漏洞；QSA kernel 内的 dispatch
+barrier（`push()`：`d.barrier = !nb_`，默认加 barrier，`prompt_chunk` 里唯一的 `nb_=true`
+只在 `l==0` 的 PLE 处理，tail 不碰）也确认正确。
+
+**后续补充实验，把结论钉死为 100% 确定性（不是 race）：**
+
+- **同一套二进制、同一套代码，连续 5 次完整重启（kill 两个 daemon、清空 state 目录）跑同一个
+  A-then-B，B 的输出字节级完全相同**（`[[els_improved]]...` 一字不差，不只是"都是乱码"而是
+  "连乱码内容都一样"）。Race 不可能每次给出同一个字节序列——这直接排除了"时序竞态"框架本身，
+  不只是排除 sleep 这一个实验。
+- **把 `stream.cpp` 的 `TECTONIC_DEBUG_STREAM` 诊断 revert 掉、重新编译回"那次 sleep 成功"
+  用的二进制，同样的 sleep 4 秒再测一次——依然复现乱码。** 这排除了"是两个不同二进制导致的
+  差异"这个解释。**那一次 sleep 成功至今没有找到任何可以解释、可以复现的原因，只能归类为一次
+  未查明的异常，不构成任何方向上的证据——既不支持"时序"，也不该被当成"已经试过 sleep 没用"
+  之外的任何结论。**
+- **A 换成极短 prompt（内容"1"，`max_new=1`，几乎不脏 expert cache）后，B 的结果是第三种
+  形态，既不是"复用时的重复乱码"也不是"单独跑时讨论天空颜色的正确答案"，而是语法通顺、语义
+  连贯、但答非所问的一段文字**（讨论"数组最大子段和"算法，和"天空是什么颜色"毫无关系）。这
+  排除了"only 两种结果（对/错）"的简化预期，但也是正面证据：**B 的具体结果确实随 A 的历史而
+  变，且每种历史都给出各自确定、内部自洽的结果**——这和"读到了某种不属于自己这次请求的、
+  连贯的内容片段"的直觉一致，比"数值噪声被放大"更接近"读错了内容来源"。
+
+**当前最强、尚未验证的假设（PC 提出）：`ExpertStream::at_layer`（`stream.cpp:620`）里
+cache hit 和 miss 走的是两条不同的代码路径**——hit 时 `if (st == 0) { ... }` 直接认为
+`where_[key]` 指向的 slot 已经是这个专家可用的数据；miss 时 `submit(s, l, e, true)` 发起一次
+新的读取、`wait.push_back(s)` 等它完成。**如果这两条路径最终喂给 GPU 的不是同一个等价的
+内存表示**（例如一个是已经转换/重排过的设备侧副本，另一个是刚从 host 侧 blob 读入、尚未经过
+同样转换的原始数据；或者反过来），"同一个 key 对应同一份权重"这个假设就不成立，数值差异就有了
+物理来源——而且这个来源**天然是确定性的**：取决于 A 把哪些专家变成了 resident（hit），哪些
+还没有（miss），对 100% 确定性、5/5 字节级一致的复现完全吻合。**下一步最小验证实验**：
+挑一个具体的 `(layer, expert)` pair，分别在"cache miss（B 从未跑过）"和"cache hit（A 已经
+让它 resident）"两种情况下跑同一次 prompt，对这个专家实际参与计算后、被 GPU 读到的那份数据
+（或者它对输出的贡献）做 checksum 比较——如果不同，就实锤了 hit/miss 路径不等价；如果相同，
+这条假设也可以排除。
+
+**当前状态总结（给下一个接手的人）**：bug 100% 确定性复现（不是概率性 race），结果字节级
+稳定；已排除 11 类候选（上一条记录）；唯一一次"sleep 修好了"的异常无法复现，revert 二进制
+后依然无法复现，因此不构成任何方向的证据，可以彻底放下不再纠结；当前最可能的方向是
+"expert 缓存 hit 与 miss 两条路径读到的数据不等价"，需要上面那个对比单个专家在两种状态下
+数值的最小实验来证实或证伪。
+
+新增诊断（已 revert，未提交）：`metal/src/engine/stream.cpp`（`at_layer` 入口的
+`TECTONIC_DEBUG_STREAM` 门控队列状态打印——诊断过程中用过，结论用完即焚，当前代码已经不
+包含这段，如果下次要重新查队列状态可以参考这条记录里描述的打印内容自己加回去）。
+
+## 2026-11-22（续二）：找到一个可控的杠杆（A 的 prompt 长度），但"non-split 对照"此前的方法论有缺口——补上之后范围进一步收窄到 split 配置本身，具体机制仍未定
+
+**1. 找到一个干净、可复现、可调参的杠杆：A 的 prompt 长度决定 B 的失效形态。**
+用验证过自己输出合理的短 prompt 重做实验（不是上一条记录里那个自身就输出异常的"1"）：
+A="Hi"（55 token，3/3 复现正确）→ B 完全正确；A="Hi there"（56 token）→ B 退化成"连贯但
+答非所问"（这次聊的是"美国每年下雨天数"，和"天空颜色"无关）；A="What is your favorite
+color"（59 token）→ B 变成立即 EOS、零输出；A="What is 2 plus 2"（61 token）→ B 是
+`els_improved` 循环乱码。**这是一条随 A 的长度单调加重的退化曲线，四种不同的失效形态，不是
+一个固定分支的二元翻转**——和"某个 `if (n<=N)` 硬编码边界"的预测不符，更像一个连续量跨过
+临界点之后的渐进恶化（PC 的判断）。
+
+**2. 给 `ExpertStream::hold_region` 加了 occupancy 诊断，量出这条曲线背后的物理量。**
+`TECTONIC_DEBUG_OCCUPANCY`（`stream.cpp`，统计 `where_` 里非 -1 的条目数 / `slots_.size()`）：
+A=55 时 B 开始前 occupancy=91.7%（1584/1728）；A=56 时 93.5%（1615/1728）——**只差 31 个
+slot，占总容量不到 2 个百分点，就从"完全正确"跳到"答非所问"**。更关键的事实：split-tail
+的 `slots_.size()` 只有 1728，而 non-split（entry+tail 合一的单进程）同样的模型是
+15715——**tail 的 per-layer 缓存容量只有 non-split 的约 1/4.5**（1728/24 层 ≈ 72，
+15715/48 层 ≈ 327），哪怕是最短的"Hi"也已经把 tail 的 cache 挤到 91.7% 满。
+
+**3. 重要的方法论修正：此前"non-split 正常"这条对照，测试的 prompt 根本没有走到可比的代码
+路径，不能直接拿来当"split 独有"的证据。** `prompt_run_rows` 里走 GEMM/`hold_region` 这条
+路径的条件是 `split || n >= 64`（`window.cpp:3944`）——**split 为真时无条件进，non-split
+只有 prompt ≥ 64 token 才进**。此前所有"non-split 正常"的测试用的都是 55-61 token 的
+prompt（< 64），**non-split 那边根本没有调用过 `hold_region`，走的是完全不同的代码路径**，
+之前的对照不构成"同一段代码在两种配置下表现不同"的证据。
+
+**补上干净对照后，结论反而更明确地指向"split 配置本身"而不是"`hold_region`/GEMM-arena 机制
+本身"：** 用一个 74-token 的 prompt（确认日志里 `occupancy=100.0%`，真正触发了 non-split
+下的 `hold_region`）跑 non-split 的 A-then-B，**B 依然完全正确**。也就是说，就算 non-split
+的 cache 打到 100% 满、真正走过同一条 `hold_region`/GEMM-arena 路径，也不出问题——**bug 不是
+"任何配置下 cache 打满就会复用出错"，而是 split（entry+tail 两个独立进程、两个独立
+`ExpertStream`）这个配置特有的**，同样被排除的还有"tensor 重叠/显存复用"这条线
+（PC 的论证：静态内存重叠和走哪条路径无关，不会只挑 split 一边出现）。
+
+**4. PC 提出一个新的、尚未证实或证伪的具体机制：tail 的 session 是 layer-range carve 出来的
+（`qsa_ord0=6`，和 non-split 的 `qsa_ord0=0` 不同），如果某处代码把"`qsa_states` 数组下标"
+和"全局 QSA 序号"搞混，这种错位只会在 split 下出现（因为 non-split 下两者恒等于 0 开头）。**
+顺着这个方向查了全仓库 `qsa_ord0` 的每一处用法（`session.cpp`／`verify.cpp`／`generate.cpp`／
+`window.cpp`／`conversation_state.cpp`）——**全部正确地写成 `qsa_states[qsa_ord0 + j]`，
+没有找到混用的地方**；也查了 `at_layer` 的专家路由预测输入（`cut_ids_ = p.ids`，`route_topk`
+kernel 按层写入）——**这条路径完全不读 `ss.qsa_states`/`qsa_ord0`，是独立于 QSA 的纯 MoE
+路由机制，不存在这种错位的物理可能**。这两条路径目前都查清白了，但"哪两套索引体系被混用"
+这个猜测本身仍然成立、只是还没找到具体是哪一行——留给下一轮。
+
+**当前状态总结（更新）**：bug 100% 确定性、随 A 长度单调加重（四种失效形态，不是二元翻转）；
+已有一个干净、可复现、可调参的杠杆（A 的 token 数）；已确认 split 的 expert 缓存容量只有
+non-split 的约 1/4.5，哪怕最短的 prompt 也接近 90% 占用；已排除"`hold_region`/GEMM-arena
+机制本身有 bug"（non-split 在 100% occupancy 下同样走这条路径、依然正确）、"tensor 重叠"、
+"qsa_ord0 在 bind_session／expert 路由预测两条已知路径里的混用"；当前最强、仍未证实或证伪
+的假设依然是 PC 提出的"cache hit 与 miss 两条路径给 GPU 的数据不等价"，具体是 split 配置
+下的哪个机制放大了这一点仍未定位。**下一步建议**：(a) 对 A=55/56 两种 occupancy 状态下
+`where_` 表取差值，找出那 31 个被多驱逐的 `(layer, expert)` key，检查 B 的路由会不会用到
+其中任何一个；(b) 如果能找到控制 expert 缓存容量的参数，把 non-split 的容量人为调小到
+split 同等水平，看 non-split 会不会在容量相近时也复现——这能直接区分"容量不足本身触发
+一个通用 bug"和"split 配置有它独有的额外问题"。
+
+新增诊断（未 revert，保留）：`metal/src/engine/stream.cpp`（`hold_region` 入口的
+`TECTONIC_DEBUG_OCCUPANCY` 门控 occupancy 打印，默认不生效，无害）。
+
+## 2026-11-22（续三）：找到一个真实、可靠、已验证的缓解方案——扩大 split-tail 的 expert 缓存容量
+
+顺着上一条记录"容量"这条线，直接做了 PC 建议的那个最便宜、最能一刀两断的实验：
+**把 tail 的 expert 缓存容量人为调大，看之前 100% 必坏的场景会不会变好。**
+
+用 `STRATA_METAL_ARENA_GB=10`（默认约 3.4 GB / 1728 slot，调到 10 GB / 5395 slot，约
+3.1 倍）启动 tail，**本条记录追踪的所有失败场景全部修复，包括最严重的那个**
+（A="What is 2 plus 2"，61 token，此前 100% 复现 `els_improved` 循环乱码）——B 变成完全
+正确、连贯的"天空是蓝色，瑞利散射"那套标准回答。连续 3 次完整重启复测，**3/3 次字节级一致
+的正确输出**。这是这次 bug 调查里第一个真正"修好了"的结果，而不是"排除了一个候选"。
+
+**这对项目的意义，分两层：**
+
+1. **立刻可用的缓解手段**：split 部署下给 tail（以及可能的其他非 entry stage）分配比默认
+   更大的 expert 缓存预算（`STRATA_METAL_ARENA_GB`），就能让多轮/并发请求的正确性恢复。
+   默认预算是按"这台机器、这个进程自己的可用内存"算出来的（`arena_budget`），没有考虑到
+   "split 场景下一个 stage 只需要算全模型一部分层，但为了支持多请求复用，仍然需要接近
+   non-split 水准的 per-layer 缓存深度"这件事——这本身可能是一个值得在 Tectonic 的部署
+   建议/默认配置里体现出来的产品结论，不只是调试手段。
+2. **强烈支持、但没有最终证实"hit/miss 路径不等价"这个底层假说**：扩容能修好，只说明
+   "让 cache 驱逐/未命中的发生频率降到接近零"能避开这个 bug，**不代表"驱逐/未命中本身"这条
+   因果链被证实了**——也可能是另一种尚未设想到的机制，恰好也对"miss 发生频率"敏感。
+   真正坐实根因仍然需要上面记录的"对比同一个专家在 hit 和 miss 两种状态下、被 GPU 实际读到
+   的数据是否等价"这个最小实验。**这是下一轮排查的入口，不是这次会话要收尾的地方。**
+
+**当前状态总结（最终版）**：bug 100% 确定性、随 A 的 prompt 长度单调加重，原因链条收敛到
+"split-tail 的 expert 缓存容量远小于 non-split（约 1/4.5），哪怕极短的 prompt 也接近
+90%+ 占用，容量不足触发的驱逐/未命中在某个环节产生了错误数据"；**有一个已验证、可复现
+（3/3）的缓解方案：给 split 的非 entry stage 分配更大的 `STRATA_METAL_ARENA_GB`**；
+根因本身（到底是不是"hit/miss 路径不等价"，具体是哪一行）仍未最终定位，但现在有了一个
+真正能让用户当下用起来的出口，不必等根因修好才能支持 split 多轮/并发。
+
+新增诊断（未 revert，保留）：`metal/src/engine/stream.cpp`（`hold_region` 的
+`TECTONIC_DEBUG_OCCUPANCY` 诊断）。**`STRATA_METAL_ARENA_GB` 不是新增的——它是已有的、
+文档化的启动参数（`window.cpp` 里本来就读取），这次会话只是第一次把它和这个 bug 联系起来。**
+
+**补充两点技术细节（PC）**：(1) tail 的 per-layer 缓存容量只有 non-split 的约 1/4.5，
+**不是代码按层数把预算平分**——`make_arena` 的 `budget` 来自 `arena_budget()`（这台机器
+当时实际可给的内存），split 下 entry 和 tail 是两个独立进程、各自申请、各自拿到一份，
+tail 自然分不到 non-split 单进程能拿到的那么多；也就是说"给 split 的非 entry stage 配
+更大内存额度"是一个**部署参数**，不需要改代码结构。(2) `cls_` 里会有一个 `pages=0` 的
+size class（tail 的 `lay_[0..23]`——它不拥有的那些层——没有 expert tensor，分组时这些
+"空"条目也会被收进来），它在 `base += k.n` 里占编号但 `total += k.n*0*PAGE` 贡献 0
+字节，**不占内存，不是配置浪费**，免得以后有人又重新查一遍。
+
+**曾尝试、已证明方法有缺陷、不构成任何结论的一次实验（记录下来避免重复犯同一个错）**：
+为了直接验证"cache hit 和 miss 给 GPU 的数据是否等价"，在 `at_layer` 里加过一个诊断，
+对比"默认 1728-slot arena 跑 B"（很多 miss）和"10 GB/5395-slot arena 跑 B"（很多 hit）
+两次运行中、同一个 `(layer, expert)` 的 host 侧数据 checksum。**结果不可信**：哪怕两次
+都是 `hit=1`（双方都不是刚读的新数据，理论上必须是磁盘上同一份、完全确定的字节），1635
+对里仍有 775 对（47%）checksum 不一致。这么高的比例说明问题出在测量方法本身——最可能是
+checksum 的范围覆盖了整个 size class 分配（`cls_[cls_of(s)].pages * PAGE`），而不是
+这个专家实际用到的精确字节数，多出来的 padding/尾部可能残留着**上一个占用者**的数据，
+两次独立进程运行里自然不同，和 hit/miss 毫无关系，纯粹是 checksum 粒度太粗；另外这次读取
+发生在释放 `mu_` 锁**之后**，虽然 `pin` 理论上保护到这次 `at_layer` 结束，但不能排除还有
+别的时序因素。**这个诊断已经 revert、未保留在代码里。** 下次要做这个实验，必须先精确对齐
+"专家实际权重的字节数"（不是 size class 的整数倍，要看 gate/up/down 各自的真实大小），并且
+在锁保护下完成读取，才能回答这个问题。
+
+**同一时间来自 PC 侧的一个很锐利的旁证，值得记下来指引下一轮方向**：如果根因是"层间权重
+错位"（比如第 15 层的 slot 被第 6 层的专家权重占据），模型的隐藏维度/语义空间会直接对不上，
+输出应该是彻底不连贯的噪声；但本条记录和上一条记录里观测到的"连贯但答非所问"（讨论一个
+完全无关的话题，却语法通顺、语义自洽）**更像是模型的推理链路本身工作正常，只是它看到的
+上下文/输入换成了别的文本的表示**——这把怀疑方向从"权重侧错位"进一步推向"输入侧
+（KV/hidden state 里混入了别的对话的表示）"，和更早记录里"entry 的 handoff checksum 一致、
+但 tail 自己写出的 `kq_` 不同"这个观测完全吻合。**下一轮如果要验证根因（不只是维持现在的
+缓解方案），这是比"hit/miss 数据是否逐字节相同"更值得先确认的方向：先确认是不是真的有一段
+不属于当前请求的、连贯的 KV/hidden 表示混了进来，而不是先假设是权重或纯数值问题。**
+
+## 2026-11-22（续四）：按 PC 的三点要求重做 hit/miss 实验——干净的负面结果，排除专家权重侧
+
+上一条记录里那次 hit/miss checksum 实验被 PC 指出一个比"padding 太粗"更根本的问题：**比较的
+两边全都是 `hit=1`，从头到尾没有真正对比过 hit 和 miss 这两条路径，47% 不一致这个数字对
+"hit/miss 是否等价"这个问题贡献的信息量是零。** 按 PC 给的三点要求重做：(1) 真正制造一次
+miss（小 arena 下某专家被驱逐）和一次 hit（大 arena 下同一专家仍然 resident），各自确认
+`st`/`path` 字段；(2) checksum 范围改成 `lay_[l].gs + lay_[l].us + lay_[l].ds`（这个专家
+实际的权重字节数），不再用 size class 的 padding 后容量；(3) 读取放在 `mu_` 锁保护下，
+miss 的那份在 `done_cv_.wait` 完成、仍持有同一把锁时读。
+
+**结果干净、确定：针对 layer 25，找到 17 个"默认小 arena 下是真 MISS、10 GB 大 arena 下是真
+HIT"的专家，17/17（100%）checksum 完全一致。** 这次方法论上没有歧义——两边确认走的是不同
+分支（一个真的从 SSD 读，一个真的直接命中），覆盖的字节范围是这个专家精确的权重大小，读取
+在锁内完成。**这排除了"cache hit 和 miss 两条路径给 GPU 的数据不等价"这个假说本身**（至少
+对 expert 的 FFN 权重数据而言）——同一个专家的权重，不管是刚从磁盘读出来还是已经常驻，字节
+完全相同。
+
+**这把排查范围进一步收窄、也更加确认了 PC 和 FORK_LOG 这几条记录反复指向的方向**：entry 的
+handoff 干净（已验证）、GDN/PLE 状态跨对话一致（已验证）、现在 expert 权重在 hit/miss 下
+等价（新验证）——**entry、FFN/MoE 权重、GDN 这几条线基本上都排除了，剩下的只有 tail 自己的
+QSA attention 计算（K/V 的写入/索引/indexer）这一处还没有直接证据证明清白**。"连贯但答非
+所问"这个失效形态（PC 的论证：跨层权重错位该是不连贯的噪声，而不是语法通顺的另一个话题）
+继续支持"KV/上下文被混入了别的内容"，而不是"权重读错了"。
+
+**下一轮的入口非常具体**：对比"B 单独跑"和"B 复用退化"两种场景下，tail 自己在 QSA 层写入/
+读取的 K/V（`kq_`/`vq_`/`ksc_`/`vsc_`，用自动探测的真实 index，不是死掉的 0 号）在**整个
+prefill 过程中逐 cell 的内容**（不只是像更早记录那样看 prefill 完成后的最终 checksum，而是
+看写入的中间过程，确认是不是真的有一段不属于当前 token 序列的、连贯的历史 K/V 混了进来，
+混入的具体机制——是 indexer 的某个候选范围没有被正确地按当前 cell 数裁剪、还是别的）。
+
+新增诊断（已 revert，未保留在代码里；这次的方法——真实 hit/miss 分流 + 精确字节范围 + 锁内
+读——是可信的，下次需要类似实验时可以照这个模式重建，不需要再踩一遍"比较了两个 hit"那个坑）。
+
+## 2026-11-22（续五）：逐 cell 对比——分叉从 B 的第一个 cell 就开始，不是渐进式污染
+
+按上一条记录的入口，加了一个逐 cell 的 K checksum 诊断（`TECTONIC_DEBUG_PERCELL`，
+`window.cpp`，`prompt_chunk` 写完之后对 `kq_[jd]` 按 cell 粒度——不是整个 buffer——逐个
+算 FNV-1a），对比"B 单独跑"和"B 紧跟 A 复用退化"两种场景。
+
+**结果出乎意料：B 自己 prefill 的第 0 个 cell（这次对话的第一个 token）checksum 就已经
+不一样，不是从某个中间 cell 才开始分叉。** 这和"读到了前一个对话遗留在后面某处的 K/V"
+这个直觉模型不符——如果是"历史 KV 残留被读到"，至少前几个属于 B 自己、刚写入的 cell 应该是
+对的，分叉应该出现在"B 自己的内容用完、indexer 越界读到别处"的某个点上。**从 cell 0 就错，
+意味着连 B 自己第一个 token 的 K/V 写入过程本身，计算出来的数值就和"单独跑"时不同。**
+
+这把已知排除的清单再收紧一层：entry 的 handoff（这个 cell 对应的残差输入 R）已证明一致、
+GDN 状态一致、PLE 状态一致、现在 expert 权重在 hit/miss 下也证明等价——**qsa_prep 这个
+kernel 对 cell 0 的所有已知输入都被证明相同，输出却从第一个 cell 起就不同**。顺手查了一个
+新候选并排除：`mrope_`/`g_mrope_host`（"M-RoPE"，传给每次 `qsa_prep` 调用的 `mtab`
+参数）——确认这是纯视觉/图片位置表机制（`mrope_table_set` 的调用点报错信息是"cannot
+allocate the image position table"），我们的测试全程纯文本、不带图片，`g_mrope_host`
+应该全程为 `nullptr`，这条路径对本次复现不生效。
+
+**当前候选已经耗尽了"host 侧可读、可比较"的输入**：剩下能解释"所有已知输入相同、输出却
+不同"的候选只剩两类：(a) 还有一个我们没想到、没检查过的输入（可能性仍然存在，但已经是
+"不知道该往哪找"的程度）；(b) GPU kernel 计算本身存在某种和"这是不是这个 pipeline 第一次
+被调用"相关的非确定性或隐藏状态（不是 expert cache 那种已排除的机制，而可能是 Metal
+threadgroup 内存初始化假设、kernel 变体缓存、或者别的更底层的东西）。**到这一步，继续靠
+host 侧打点可能已经摸到了这种方法的天花板——下一轮如果要继续定位根因（不只是维持现有的
+扩容缓解方案），大概率需要真正的 GPU 帧捕获/调试工具（Xcode Metal frame capture 之类），
+而不是再加一层 `fprintf`。**
+
+新增诊断（未 revert，保留）：`metal/src/engine/window.cpp`（`prompt_chunk` 末尾的
+`TECTONIC_DEBUG_PERCELL` 门控逐 cell checksum，默认不生效，无害，下次需要类似粒度的对比
+可以直接复用）。
+
+## 2026-11-22（续六）：`hold_region`/`region_slots_` 的 `where_` 全表扫描——反相关，排除整条线
+
+PC（HIP 后端协作者）把跨层权重混用的假说改写后（"slot 被跨层复用时状态清理不完整，
+where_/smap_/x.layer/x.e 这一组在'归还'时有一个没完全重置"），指出三个具体可疑点：
+(1) `victim()` 清 `x.layer/x.e` 但 `io_main` 完成时用的是 job 队列里缓存的 `j.layer/j.e`，
+slot 中途被复用会让两者脱节；(2) `cancel_slot` 清了 `where_`/`smap_`/`x.layer`/`x.e`/
+`x.pre`/`x.left`，但只从 `pre_q_` 摘除匹配项，从未检查 `urgent_q_`，可能留下指向旧
+layer/expert 的残留 job；(3) 最可疑的一点——`hold_region(false)` 只设 `state=0` 和
+`lru_back`，完全不碰 `layer`/`e`/`where_`/`smap_`：如果 `hold_region(true)` 把一个 slot
+划进 scratch 区域、其内容被 prompt GEMM 的写入覆盖，但 `where_` 表里还留着指向它的旧
+key，`hold_region(false)` 把它放回 LRU 后，`at_layer` 会继续用"三件套全通过"
+（`state==0 && where_>=0 && smap_有值`）误判为命中，直接把被 scratch 覆盖过的内容当成
+那个专家的权重用——且这个过程不含任何随机性，完全由 arena 布局和前序请求的路由决定，天然
+解释了"100% 字节级确定性复现"。
+
+PC 给出一个比 frame capture 便宜几个数量级、且不论假说对错都能给出确定性答案的检查：在
+`hold_region(true)` 清完 `region_slots_` 之后，再扫一遍 `where_` 全表，统计有多少条目的
+值落在 `region_slots_` 里、但对应 slot 的 `x.layer < 0`（也就是清理循环以 `x.layer >= 0`
+为假而跳过它）。这类条目如果存在，就是"scratch 覆盖但 key 未失效"的直接证据。
+
+在 `ExpertStream::hold_region(true)` 里加了 `TECTONIC_DEBUG_WHERE_SCAN` 门控的这个扫描
+（见 `stream.cpp`，未 revert，保留，默认不生效）：
+
+```cpp
+if (std::getenv("TECTONIC_DEBUG_WHERE_SCAN")) {
+    std::vector<uint8_t> is_region(slots_.size(), 0);
+    for (int s : region_slots_) is_region[(size_t) s] = 1;
+    int64_t stale = 0;
+    for (size_t key = 0; key < where_.size(); ++key) {
+        const int32_t s = where_[key];
+        if (s >= 0 && is_region[(size_t) s] && slots_[(size_t) s].layer < 0) {
+            ++stale;
+            std::fprintf(stderr, "DBG where_stale: key=%zu (l=%zu e=%zu) -> region slot=%d (x.layer=%d x.e=%d)\n",
+                         key, key / NE, key % NE, s, slots_[(size_t) s].layer, slots_[(size_t) s].e);
+        }
+    }
+    std::fprintf(stderr, "DBG where_scan: stale_entries=%lld (region_slots_.size=%zu)\n",
+                 (long long) stale, region_slots_.size());
+}
+```
+
+**结果，两种配置各跑一次 A→B，均为真实请求（非 fake 流程）：**
+
+- 默认/小 arena（bug 复现的配置）：`stale_entries=0 (region_slots_.size=0)`。
+- 10GB arena（bug 不复现的配置）：`stale_entries=0 (region_slots_.size=832)`。
+
+**这组交叉验证是反相关的，而且把整条 `hold_region`/`region_slots_` 线彻底排除**：不是
+"这次凑巧没测出来"，而是 `region_slots_` 机制在 bug 复现的小 arena 配置下根本就是空的、
+从未被执行过（`ExpertStream::region()` 在没有 arena chunk 留有余量时会退回
+`standalone_region()`，即匿名 mmap，不走 `region_slots_` 这条路径）——一条从未被执行的
+代码路径不可能是这个 bug 的根因。而在 10GB arena 配置下，`region_slots_` 确实被激活
+（832 个 slot），但扫描结果完全干净（0 条残留），进一步确认即使这条机制被真正使用，也
+没有 PC 假说里描述的清理缺口。
+
+这排除了 PC 三点怀疑里最具体、最容易验证的第 (3) 点。PC 随后指出这组对照同时变了两个
+变量——slot 数（1728 vs 5395，驱逐频率）和 `region_slots_`（0 vs 832，scratch 位置）——
+而 (3) 已被证明不是原因，所以剩下能解释"扩容修好"的只有驱逐频率本身：驱逐越频繁，slot 被
+不同层/专家复用的次数越多，撞上任何"复用时状态没清干净"缺口的概率越高。PC 随后自行核实了
+点 (1)：`victim()` 只选 `state==0` 的 slot，`submit()` 立刻把 state 设成 1（不等于 2），
+所以一个槽在被读期间不可能被 `victim` 选中，`x.layer` 和 job 队列里缓存的 `j.layer` 不会
+脱节——(1) 是干净的。
+
+点 (2)——`cancel_slot` 只从 `pre_q_` 摘除匹配 job，从不检查 `urgent_q_`——PC 给出一条具体
+的危险链：若某 slot 在 `urgent_q_` 里还有在飞的 part，`cancel_slot` 把它的 `state`/`left`
+清零后，I/O 线程读完那个残留 part 时 `--x.left` 会变成 -1（条件 `== 0` 为假），不触发
+`state=0`/`smap_` 更新，但 `read_part` 已经把数据写进了 `host_[s]`；而 `state==0` 这时已经
+被 `cancel_slot` 设好，`victim()` 可以立刻把这个 slot 派给一个新专家，新旧两个专家的字节就
+会混进同一个 slot——如果成立，这正是"权重混用"的物理形态，而且是确定性的（由 arena 布局和
+路由决定），同时解释"连贯但答非所问"（语义正确、来源错误）而非纯数值噪声。
+
+**在采纳这条之前，沿着实际的同步结构逐步核实了一遍，结论是这条路径在当前代码里不可达**：
+`submit()`（stream.cpp:338-349）把一个 job 的全部 part 原子性地整体压入 `pre_q_` 或
+`urgent_q_` 二选一，不会出现部分在一边、部分在另一边的情况；唯一能把 entry 从 `pre_q_`
+搬到 `urgent_q_` 的只有 `promote_slot()`（stream.cpp:366-372），且它在**同一把锁内**把该
+slot 在 `pre_q_` 里剩下的**全部** entry 一次性搬空，不是部分搬运。而 `cancel_slot` 的两个
+调用点（`at_layer` 的 line 644-650、`hold_region(true)` 的 line 777-781）发现候选 slot 的
+唯一方式是"在 `pre_q_` 里扫到属于它、且 `state==1` 的 job"——如果这个 slot 之前被
+`promote_slot` 处理过，`pre_q_` 里已经一条都不剩，扫描根本发现不了它，更谈不上对它调用
+`cancel_slot`。也就是说：**一个 slot 一旦有任何 part 被 promote 进 `urgent_q_`，就从
+`cancel_slot` 的可触及集合里永久移出**，不存在"`state==1` 但 `urgent_q_` 里有残留 job"这个
+中间态。另外，`hold_region(true)` 自己的 `cancel_slot` 调用发生在
+`done_cv_.wait([&]{ return outstanding_ == 0; })` 之前；等这个 wait 真正放行、代码继续往下
+清理 `region_slots_` 时，`outstanding_ == 0`（全局计数）已经保证两条队列此刻都是空的——不
+可能有任何在飞 job。
+
+**结论：PC 三点怀疑全部查完，均为阴性**（(1) victim/io_main 层号脱节——安全；(2) cancel_slot
+的 urgent_q_ 残留——代码层面不可达；(3) hold_region/region_slots_ 清理缺口——反相关实测排除）。
+这把"跨层专家权重混用（经由某种状态清理缺口）"这整条假说家族排除到了代码能验证的极限。已把
+这个反驳同步给 PC，并提出下一步的两个方向：(a) 还存在一个双方都没想到的第四类状态；
+(b) host 侧 `fprintf` 诊断确实已经到头，需要上 Metal frame capture，直接比对"同一个 dispatch
+在两次运行里的输入 buffer 字节"——这是纯数据对比，不受捕获本身引入的同步/时序变化影响，
+适合这种已经确认是 100% 确定性、而非时序竞态的 bug。
+
+## 2026-11-22（续七）：根因找到并修好——`standalone_region` 的 `region_bytes_ = 0` 让跨请求的清零变成空操作
+
+在上一条发出后几分钟，PC 独立从 `region_slots_=0` 这个结果反推出了真正的根因，绕开了整条
+"跨层专家权重混用"假说家族（专家权重侧从始至终都是干净的——这才是污染源头实际上不在
+`ExpertStream` 的专家缓存那部分，而在它旁边的 prompt GEMM 便笺（scratch）分配逻辑）。
+
+**根因**：`Window::prompt_gemm_init`（`window.cpp:3170`）有 `if (pg_) return true;` 这个一次性
+初始化闸门——`PromptGemm` 结构体里的每一个 buffer（`R` 残差流输入、`qfull`/`kcur`/`vcur`
+K/V 投影、几乎整条 prompt 前向路径要用到的 scratch）都是在**整个进程生命周期内只分配一次**，
+之后每一个新 prompt 请求都复用同一块物理内存（`cx_->wrap(region, b)` 把这些 buffer 包进同一个
+`region` 指针）。当 arena 太小、挤不出一块 slot 区域给 prompt scratch 时（`ExpertStream::region()`
+退回 `standalone_region()`——也就是本次所有复现用例的配置，日志能看到
+"the arena is small: the prompt's N GB of buffers are their own allocation"），
+`standalone_region()`（`stream.cpp:755`）把 `region_bytes_` 硬编码成 **0**，注释写的是
+"fresh zero pages; nothing in the arena to empty"——这句话对**第一次**调用是对的（`mmap`
+给的新页确实全零），但 `region_`/`region_bytes_` 是成员变量，会原样留到下一次请求；而
+`hold_region(true)`（每个 prompt chunk 开始前都会调用，split 模式无条件进入）清零 scratch 的
+唯一动作是 `std::memset(region_, 0, (size_t) region_bytes_)`——**用的正是这个被硬编码成 0 的
+长度**。于是从第二个请求开始，这个 `memset` 永远是长度 0 的空操作，B 的 prompt GEMM 直接在
+A 留下的 scratch 残留上开始写自己的数据。
+
+这条根因同时解释了本轮调查里每一个此前"最难解释"的观测，不需要再叠加任何第二个机制：
+- **B 的第一个 cell 就错**：scratch 从第一行开始就是脏的，不是某种边界之后才越界读到的。
+- **A 越长、B 越差（55 正确 → 56 答非所问 → 59 零输出 → 61 循环乱码）**：A 写进 scratch 的
+  残留随 A 的长度单调增多，B 的更多行被污染。
+- **10GB arena 下完全正确、且 `region_slots_` 反而非空**：大 arena 走的是 `region()`（不是
+  `standalone_region()`），那里 `region_bytes_ = end - lo` 是真实非零值，`memset` 真的执行。
+- **100% 字节级确定性复现**：A 留下的 scratch 内容本身是确定性的（给定固定权重和路由），不涉及
+  任何时序或并发窗口。
+- **专家缓存 hit/miss 的 17/17 checksum 一致、`region_slots_` 扫描 0 条残留**：这两项之前的
+  "阴性"结果都是对的——污染根本不在专家权重那条路径上，在它旁边的 prompt scratch 分配上，
+  两者是同一个 `ExpertStream` 里两套相互独立的东西（专家 slot vs. 一次性 GEMM scratch 分配）。
+
+**修复**（`metal/src/engine/stream.cpp`，`standalone_region`）：把 `region_bytes_ = 0` 改成
+`region_bytes_ = sz`（函数开头已经算好的、页对齐后的分配大小），让 `hold_region(true)` 的
+`memset` 每次都清掉这一整块复用的 scratch，并在函数上方补了注释说明这个一次性分配会被所有
+后续 prompt 复用、为什么长度不能是 0。
+
+**验证**（真实两节点部署，entry[0,24)+tail[24,48)，默认/小 arena，不设
+`STRATA_METAL_ARENA_GB`，tail 日志确认走的就是 "the arena is small" 这条路径——也就是本轮
+所有复现用例的确切配置）：连续三个不同对话——"What is 2 plus 2" → "What color is the sky"
+→ "Name three fruits"——全部正确。第二个请求不再是 `els_improved` 循环乱码，而是正常的
+"The user asks: \"What color is the sky\". This is a simple..."；第三个请求同样正常，证明
+修复不是只对第二个请求生效、而是每次 `hold_region(true)` 都正确清零。
+
+这把 split-stage 第二次对话污染这个 2026-11-22 当天发现、追了一整天的 bug 实际修复了——
+不再只是"已知可靠的缓解方案"（`STRATA_METAL_ARENA_GB` 调大隐藏了问题，不是修好了问题），
+而是代码本身的修复。感谢 PC 坚持追查"scratch 清零"这条线，没有被"专家权重混用"这个更复杂、
+但实际上是错误方向的假说带偏。
+
+**顺手解释了早前一次"测过但没效果"的诊断为什么没效果**：本次会话更早之前加过一个
+`TECTONIC_DEBUG_PGZERO` 诊断（`window.cpp`，`prompt_chunk` 开头在 `pos0 == 0` 时手动
+`memset` 清零 `p.scores/p.qids/p.qidx/p.part/p.XQ/p.qcur/p.qcurh/p.ids/p.wts/p.qfull/
+p.kcur/p.vcur/p.iqr/p.ikr/p.R`），测试后判定"不能修好这个 bug"，一度让排查方向偏离
+"scratch 残留"这条线、转向了专家权重。现在看，这个诊断其实是**同一个根因下的一次不完整
+尝试**：它覆盖了 QSA 相关的 scratch（`R`/`qfull`/`kcur`/`vcur` 等），但遗漏了 GDN
+（gated delta net，与 QSA 交替的那一半层）用到的 scratch（`p.qkv`/`p.z`/`p.al`/`p.be`/
+`p.yg`/`p.gqn`/`p.gkn`/`p.gvc`/`p.ggb`/`p.gkq`/`p.go` 等）和其余中间 buffer（`p.V`/
+`p.mixed`/`p.inj[0,1]`/`p.bo` 等）——这些同样是 `pg_` 一次性分配、被所有后续 prompt 复用、
+同样会把上一个请求的残留带进下一个请求。只清一部分，残留还是能从另一部分漏进来，所以这个
+局部诊断测出"无效"，但不代表方向错了，只代表覆盖不全。真正的修复（`standalone_region` 的
+`region_bytes_`）是在分配层面一次性清掉整块 scratch，不依赖列全每一个字段，天然不会有这个
+遗漏问题。这个不完整的诊断已经从 `prompt_chunk` 里删掉（`TECTONIC_DEBUG_PGZERO` 整段，
+连同判断分支），重新编译、真实两节点部署重测 A→B 确认删除后行为不变（仍然正确）。
+
+**加固（PC 建议，均已采纳）**：`region_bytes_` 在 `stream.h:107` 声明处原本完全没有注释，
+而它在两处赋值、一处使用时各自被读出不同的隐含语义——`region()` 里 `region_bytes_ =
+end - lo` 读起来是"从 arena 借了多少"，`standalone_region()` 里原来的 `= 0` 也读起来是
+"没借所以是 0"，但 `hold_region(true)` 里 `memset(region_, 0, region_bytes_)` 要的其实是
+"需要清零多少字节"——`region()` 路径下两个语义碰巧相同，所以一直是对的，`standalone_region`
+路径下两个语义不同，这才是 bug 的根源。现在在声明处写清楚了这个字段的真实含义（清零用的字节数，
+不是借用量），并在 `hold_region(true)` 的 `memset` 之前加了 `assert(!region_ ||
+region_bytes_ != 0)`——这个 bug 能潜伏到今天的根本原因是它没有任何可检出的状态（所有指针
+合法、所有 checksum 一致、没有任何断言失败，只是那块内存没被清零），这条断言把"有 region
+但清零长度是 0"这个本该不可能发生的状态变成启动即炸，而不是又一次悄悄产生错误输出。加固后
+重新编译、真实两节点部署重测 A→B 确认断言不触发、输出仍然正确。
+
+**待办（已记录，未在本轮完成）**：PC 指出 `(split || n >= mn)`（`window.cpp:3805`，`mn` 默认
+64）这个 `prompt_gemm_init`/`prompt_chunk` 的进入条件和 split 无关——**`--serve`（非 split
+单进程）在 streaming 模式下处理任何 ≥64 token 的 prompt 时也会走这条路径，如果当时的 arena
+小到需要 `standalone_region`，第二个这样的请求同样会读到第一个的 scratch 残留**。之前验证
+`--serve` 多轮对话一直用的是 26/30 token 量级的短 prompt，恰好没跨过这个阈值，所以没有暴露过
+这个问题。这意味着这个 bug 的影响范围可能不止 `--tectonic` split，需要在 `--serve` 上补一次
+"连续两个 ≥64 token 的不同 prompt、arena 小到走 standalone_region"的真实验证，确认后把这一条
+从"已知限制"挪到"影响范围"里。同样待办：补一个专门的回归测试（连续两个不同 prompt，断言第二个
+的输出不等于第一个的，或者直接断言 `R`/`qfull`/`kcur` 在第二个请求开始时的 checksum 为零）。
+
+**方法论教训（PC 总结，记录在案）**：这个根因的形状和本次会话更早之前的 `09e21ed13`（`set_of_ss_`
+被覆盖、reset 清错缓冲）属于同一族——**都是"某个一次性初始化建立的前提，在第二次使用时已经不再
+成立，但代码仍然相信它"**。`standalone_region` 里"fresh zero pages; nothing in the arena to
+empty"这句注释本身没有错，只是它描述的是一个瞬时事实（mmap 新页确实全零），代码却把它当成了永久
+前提（这块内存只分配一次、被所有后续请求复用）。排查这类 bug 时，看到"只做一次"的初始化逻辑，
+应该下意识去问"这个初始化建立的假设，在第二次使用这份状态时还成立吗"。
+
+**上游状态（PC 核实）**：这个 bug 在上游 `Niko1221/Strata`（`origin/main`，`c6f6427d9`，目录已从
+`metal/` 重组到 `engine/metal/`）里原封不动地存在，社区从未报过（搜索确认只有两个"相邻但不同"的
+改动落在同一个 `standalone_region` 契约边界上——#6446 和 #3527，两者都是处理这块内存"没还回去"，
+不是"没清零"）。已基于 `origin/main` 开干净分支（单 commit，只含这一处修复 + `stream.h` 的语义
+注释 + `hold_region` 的断言），推到 `myrepo`（`DR1N0/Strata`），向上游提交了 PR：
+[Niko1221/Strata#6722](https://github.com/Niko1221/Strata/pull/6722)。PR 描述按上游实际使用的
+模板写（"## Problem and result" / "## Related discussion" / "## Approach" / "## Validation"
+的 Passed/Failed/Not run 三段式，参照了 #6441/#6446/#3527 的真实格式），如实区分了"针对本 fork
+的真实验证"和"没有重新搭建上游这套重组后的树做端到端验证，只做了语法检查"。
+
 ## 维护规则
 
 1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。哪怕代码要贴着引擎写，

@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -752,13 +753,21 @@ uint8_t* ExpertStream::region(uint64_t bytes) {
 
 // The prompt's buffers as their own anonymous allocation (fresh zero pages), when no region of the arena's slots
 // takes them: no slots are held while a prompt runs, and the arena keeps decoding with all of its slots.
+//
+// prompt_gemm_init (window.cpp) makes this allocation exactly once per process ("if (pg_) return true") and every
+// later prompt's buffers alias the same mmap - so region_bytes_ must stay the allocation's real size, not 0: the
+// first prompt's pages are fresh-zero either way, but hold_region(true)'s memset(region_, 0, region_bytes_) is the
+// only thing that clears a later prompt's share of this memory before it writes its own rows into it. region_bytes_
+// = 0 ("nothing in the arena to empty") was true only for that first prompt and turned every later hold_region(true)
+// into a no-op memset, so the second prompt's GEMM scratch (R, qfull, kcur, vcur, ...) started from whatever the
+// previous prompt had left behind - the cross-request contamination bug this fixes.
 uint8_t* ExpertStream::standalone_region(uint64_t bytes) {
     const uint64_t sz = (bytes + PAGE - 1) / PAGE * PAGE;
     void* m = mmap(nullptr, (size_t) sz, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (m == MAP_FAILED) return nullptr;
     region_slots_.clear();
     region_ = (uint8_t*) m;
-    region_bytes_ = 0;   // fresh zero pages; nothing in the arena to empty
+    region_bytes_ = sz;
     std::fprintf(stderr, "strata metal stream: the arena is small: the prompt's %.2f GB of buffers are their own "
                          "allocation, not a region of its slots\n", bytes / 1e9);
     return region_;
@@ -766,6 +775,12 @@ uint8_t* ExpertStream::standalone_region(uint64_t bytes) {
 
 void ExpertStream::hold_region(bool hold) {
     std::unique_lock<std::mutex> g(mu_);
+    if (hold && std::getenv("TECTONIC_DEBUG_OCCUPANCY")) {
+        int64_t resident = 0;
+        for (int32_t s : where_) if (s >= 0) ++resident;
+        std::fprintf(stderr, "DBG hold_region(true): resident=%lld / where_.size=%zu slots_.size=%zu occupancy=%.1f%%\n",
+                     (long long) resident, where_.size(), slots_.size(), 100.0 * (double) resident / (double) slots_.size());
+    }
     if (hold) {
         // nothing may be reading into those slots: the queued read-aheads are dropped, the running ones waited for
         std::vector<int> drop;
@@ -785,6 +800,25 @@ void ExpertStream::hold_region(bool hold) {
             x.pre = false;
             x.state = 3;
         }
+        if (std::getenv("TECTONIC_DEBUG_WHERE_SCAN")) {
+            std::vector<uint8_t> is_region(slots_.size(), 0);
+            for (int s : region_slots_) is_region[(size_t) s] = 1;
+            int64_t stale = 0;
+            for (size_t key = 0; key < where_.size(); ++key) {
+                const int32_t s = where_[key];
+                if (s >= 0 && is_region[(size_t) s] && slots_[(size_t) s].layer < 0) {
+                    ++stale;
+                    std::fprintf(stderr, "DBG where_stale: key=%zu (l=%zu e=%zu) -> region slot=%d (x.layer=%d x.e=%d)\n",
+                                 key, key / NE, key % NE, s, slots_[(size_t) s].layer, slots_[(size_t) s].e);
+                }
+            }
+            std::fprintf(stderr, "DBG where_scan: stale_entries=%lld (region_slots_.size=%zu)\n",
+                         (long long) stale, region_slots_.size());
+        }
+        // region_bytes_ == 0 here would silently turn this into a no-op and leave the previous prompt's scratch in
+        // place (the bug this guards against: see region()/standalone_region(), both of which must set it to the
+        // allocation's real size, not to how much of it looks "newly" claimed).
+        assert(!region_ || region_bytes_ != 0);
         if (region_) std::memset(region_, 0, (size_t) region_bytes_);
     } else {
         for (int s : region_slots_) {

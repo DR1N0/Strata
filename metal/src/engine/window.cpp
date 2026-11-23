@@ -292,6 +292,11 @@ public:
     bool run_slots(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
     // slot b's state <-> the main one (the GPU is idle between windows): the running state and the first `upto` cells of K/V
     bool slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::string& err);
+    // Wipes slot b's OWN stash to the all-zero "no conversation yet" state - every cell, not just the first
+    // `upto` that the next slot_copy(into_slot=true, ...) is about to fill. Call this before a slot is handed
+    // to a new, different conversation (see window_slot_reset_main's caller for why the first `upto` cells
+    // alone are not enough).
+    bool slot_reset(int b, std::string& err);
     void activate(int set);
     void set_max_t(int t) { max_t_ = std::min(t, MAXT); }
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
@@ -2297,6 +2302,17 @@ bool Window::run_slots(const int* rows, int S, const int32_t* tokens, const int6
     return ok;
 }
 
+namespace {
+// FNV-1a: deterministic, no dependency on buffer alignment/size being a multiple of anything -
+// exactly what a byte-for-byte "is this the buffer I think it is" check needs.
+uint64_t fnv1a(const void* p, size_t n) {
+    const uint8_t* b = (const uint8_t*) p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+}  // namespace
+
 bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::string& err) {
     if (b < 0 || b >= n_slots()) { err = "metal window: no such batch slot"; return false; }
     activate(0);
@@ -2307,6 +2323,31 @@ bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::s
         n = std::min({n, live.bytes, stash.bytes});
         if (into_slot) std::memcpy(stash.ptr, live.ptr, n); else std::memcpy(live.ptr, stash.ptr, n);
     };
+    // Checksums of kq_[jd]/o.kq[jd] around the exact copy this function does, to answer "did the right
+    // bytes land in the right place" with evidence instead of another hypothesis - the same method that
+    // found 09e21ed13 (a different, already-fixed bug in this same area). `jd` is picked as the first
+    // index this STAGE actually writes (kq_ holds one slot per GLOBAL QSA layer, but a layer-range stage
+    // only ever computes its own owned layers - index 0 is global QSA layer 0, which is zero for every
+    // stage that does not own it, and checksumming it proves nothing either way).
+    static const bool debug_slot_copy = std::getenv("TECTONIC_DEBUG_SLOT_COPY") != nullptr;
+    size_t jd = 0;
+    if (debug_slot_copy && !kq_.empty()) {
+        const size_t nj0 = std::min(cells * G_QKV * G_QD, kq_[0].bytes);
+        for (size_t j = 0; j < kq_.size(); ++j) {
+            const size_t nj = std::min(cells * G_QKV * G_QD, kq_[j].bytes);
+            bool allz = true;
+            for (size_t k = 0; k < nj; ++k) if (((const uint8_t*) kq_[j].ptr)[k] != 0) { allz = false; break; }
+            if (!allz) { jd = j; break; }
+        }
+        (void) nj0;
+    }
+    const size_t n0 = kq_.empty() ? 0 : std::min({cells * G_QKV * G_QD, kq_[jd].bytes, o.kq[jd].bytes});
+    if (debug_slot_copy && n0 > 0) {
+        std::fprintf(stderr, "DBG slot_copy: into_slot=%d b=%d upto=%lld cells=%zu jd=%zu n0=%zu "
+                     "src(kq_[jd])=%016llx dst_before(o.kq[jd])=%016llx\n",
+                     (int) into_slot, b, (long long) upto, cells, jd, n0,
+                     (unsigned long long) fnv1a(kq_[jd].ptr, n0), (unsigned long long) fnv1a(o.kq[jd].ptr, n0));
+    }
     const int hs = into_slot ? hp_ : o.hp;   // the committed history parity of the source
     if (!kv_only) {
     if (into_slot) o.hp = hp_; else hp_ = o.hp;
@@ -2325,10 +2366,69 @@ bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::s
         cp(tail_[j], o.tail[j], tail_[j].bytes);
         cp(dead_[j], o.dead[j], dead_[j].bytes);
     }
+    if (debug_slot_copy && n0 > 0) {
+        const size_t fb = o.kq[jd].bytes;
+        bool stale_after = false;
+        for (size_t k = n0; k < fb; ++k) if (((const uint8_t*) o.kq[jd].ptr)[k] != 0) { stale_after = true; break; }
+        std::fprintf(stderr, "DBG slot_copy: into_slot=%d b=%d jd=%zu dst_after(o.kq[jd])=%016llx "
+                     "full_bytes=%zu nonzero_beyond_n0=%d\n",
+                     (int) into_slot, b, jd, (unsigned long long) fnv1a(o.kq[jd].ptr, n0), fb, (int) stale_after);
+    }
     if (kv_only) return true;
     cp(pleHist_, o.pleHist, pleHist_.bytes);
     if (into_slot) { o.ple_hist = ple_hist_; o.ss->ple_prev[0] = ss_->ple_prev[0]; o.ss->ple_prev[1] = ss_->ple_prev[1]; }
     else { ple_hist_ = o.ple_hist; ss_->ple_prev[0] = o.ss->ple_prev[0]; ss_->ple_prev[1] = o.ss->ple_prev[1]; }
+    return true;
+}
+
+// ROOT CAUSE (found by a controlled A-then-B experiment, not by review): slot_copy's admission copy only
+// ever covers cells [0, upto) - the new conversation's own prefill+first-decode length - because that is
+// all Verifier::run/stage_ver just produced. A slot that held a PREVIOUS, longer conversation keeps that
+// conversation's K/V (kq_/vq_/ksc_/vsc_/pooled_) in every cell beyond the new `upto` untouched: reset_stage's
+// old comment ("this slot's own buffer is stale until the next compute_stage call copies fresh state into
+// it") was only true for the covered prefix, not the whole buffer. Proven with a 2-request control: A (short
+// prompt, slot 0, final position 99) followed by B reusing slot 0 produced the "els_improved" repeating-
+// garbage signature every time; A followed by C (a long prompt whose own upto=164 > 99, so its slot_copy
+// happens to overwrite every cell A had dirtied) came out byte-correct. TECTONIC_DEBUG_ZERO_KV never helped
+// because it zeroes the ACTIVE/live buffer in Window::reset() (the solo session's own K/V), never a slot's
+// own stash - a different buffer than the one this bug lives in. `--serve`'s own slot admission avoids this
+// by construction (session_zero on the slot's own SessionState before a new conversation claims it, see
+// generate.cpp's park_slot callers); --tectonic's reset_stage never had an equivalent for the Metal window's
+// slot stash, which is what this function gives it.
+bool Window::slot_reset(int b, std::string& err) {
+    if (b < 0 || b >= n_slots()) { err = "metal window: no such batch slot"; return false; }
+    SeqSet& o = *sets_[(size_t) b + 1];
+    static const bool debug_slot_copy = std::getenv("TECTONIC_DEBUG_SLOT_COPY") != nullptr;
+    size_t jd = 0;
+    bool had_nonzero = false;
+    if (debug_slot_copy) {
+        for (size_t j = 0; j < o.kq.size(); ++j) {
+            bool allz = true;
+            for (size_t k = 0; k < o.kq[j].bytes; ++k) if (((const uint8_t*) o.kq[j].ptr)[k] != 0) { allz = false; break; }
+            if (!allz) { jd = j; had_nonzero = true; break; }
+        }
+        std::fprintf(stderr, "DBG slot_reset: b=%d before: jd_with_nonzero=%zu had_nonzero=%d "
+                     "checksum(o.kq[jd] full %zu bytes)=%016llx\n",
+                     b, jd, (int) had_nonzero, o.kq[jd].bytes, (unsigned long long) fnv1a(o.kq[jd].ptr, o.kq[jd].bytes));
+    }
+    auto zero = [](const mtl::Buffer& buf) { std::memset(buf.ptr, 0, buf.bytes); };
+    for (size_t i = 0; i < o.gst.size(); ++i) { zero(o.gst[i]); zero(o.gh0[i]); zero(o.gh1[i]); }
+    zero(o.pleHist);
+    for (size_t j = 0; j < o.kq.size(); ++j) {
+        zero(o.kq[j]); zero(o.vq[j]); zero(o.ksc[j]); zero(o.vsc[j]); zero(o.pooled[j]);
+        zero(o.tail[j]); zero(o.dead[j]);
+    }
+    if (debug_slot_copy) {
+        bool still_nonzero = false;
+        for (size_t j = 0; j < o.kq.size() && !still_nonzero; ++j)
+            for (size_t k = 0; k < o.kq[j].bytes; ++k) if (((const uint8_t*) o.kq[j].ptr)[k] != 0) { still_nonzero = true; break; }
+        std::fprintf(stderr, "DBG slot_reset: b=%d after: any_kq_still_nonzero=%d\n", b, (int) still_nonzero);
+    }
+    std::fill(o.ple_hist.begin(), o.ple_hist.end(), 0.0f);
+    std::fill(o.last_norm.begin(), o.last_norm.end(), 0.0f);
+    o.hp = 0; o.pend_fold = 0; o.last_T = 0; o.last_head = true;
+    std::memset(o.last_tokens, 0, sizeof(o.last_tokens));
+    if (o.ss) { o.ss->ple_prev[0] = -1; o.ss->ple_prev[1] = -1; o.ss->ple_token = -1; }
     return true;
 }
 
@@ -3520,6 +3620,34 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     else { ss.ple_prev[0] = ss.ple_prev[1]; ss.ple_prev[1] = tokens[0]; }
     mtp_src_ = &p.R;   // the draft layer's prompt K/V read this chunk's final rows
     if (taps_on_ && !tap_deliver(tap_pro_, T, pos0, err)) return false;   // DFlash2: the prompt rows the drafter looks at
+    if (std::getenv("TECTONIC_DEBUG_SLOT_COPY")) {
+        size_t jd = 0;
+        for (size_t j = 0; j < kq_.size(); ++j) {
+            bool allz = true;
+            for (size_t k = 0; k < kq_[j].bytes; ++k) if (((const uint8_t*) kq_[j].ptr)[k] != 0) { allz = false; break; }
+            if (!allz) { jd = j; break; }
+        }
+        auto cs = [](const mtl::Buffer& b) { return fnv1a(b.ptr, b.bytes); };
+        std::fprintf(stderr, "DBG prompt_chunk_done: T=%d pos0=%lld jd=%zu gst[jd]=%016llx gh0[jd]=%016llx gh1[jd]=%016llx pleHist=%016llx "
+                     "kq[jd]=%016llx vq[jd]=%016llx ksc[jd]=%016llx vsc[jd]=%016llx pooled[jd]=%016llx "
+                     "tail[jd]=%016llx dead[jd]=%016llx\n",
+                     T, (long long) pos0, jd, (unsigned long long) cs(gst_[jd]), (unsigned long long) cs(ghist_[0][jd]),
+                     (unsigned long long) cs(ghist_[1][jd]), (unsigned long long) cs(pleHist_),
+                     (unsigned long long) cs(kq_[jd]), (unsigned long long) cs(vq_[jd]), (unsigned long long) cs(ksc_[jd]),
+                     (unsigned long long) cs(vsc_[jd]), (unsigned long long) cs(pooled_[jd]), (unsigned long long) cs(tail_[jd]),
+                     (unsigned long long) cs(dead_[jd]));
+        if (std::getenv("TECTONIC_DEBUG_PERCELL")) {
+            // per-cell K checksum, to find the FIRST cell (not just "the buffer as a whole") where a reused
+            // conversation's QSA write diverges from a fresh one - cells are G_QKV*G_QD bytes apart.
+            const size_t cell_bytes = (size_t) G_QKV * G_QD;
+            for (int64_t c = 0; c < pos0 + T; ++c) {
+                const uint8_t* base = (const uint8_t*) kq_[jd].ptr + (size_t) c * cell_bytes;
+                uint64_t h = 1469598103934665603ull;
+                for (size_t k = 0; k < cell_bytes; ++k) { h ^= base[k]; h *= 1099511628211ull; }
+                std::fprintf(stderr, "DBG percell_kq: jd=%zu cell=%lld cksum=%016llx\n", jd, (long long) c, (unsigned long long) h);
+            }
+        }
+    }
     return true;
 }
 
@@ -3733,6 +3861,10 @@ bool window_run_slots(void* w, const int* rows, int S, const int32_t* tokens, co
 bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err) {
     if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }
     return g_the_window->slot_copy(into_slot, slot, upto, kv_only, err);
+}
+bool window_slot_reset_main(int slot, std::string& err) {
+    if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }
+    return g_the_window->slot_reset(slot, err);
 }
 bool window_commit(void* w, int n_keep, std::string& err) {
     const double t0 = now_ms();
