@@ -477,7 +477,7 @@ private:
         return v;
     }
     bool run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
-    bool finish_rows(int S, const int32_t* tokens, int32_t* out, double t0);
+    bool finish_rows(int S, const int32_t* tokens, int64_t pos0, int32_t* out, double t0);
     void batch_evidence(const int* rows, int S, bool ran_rows);
     uint64_t batch_evidence_windows_ = 0;
     bool batch_evidence_rows_ = false;
@@ -1464,7 +1464,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     mtp_src_ = nullptr;
     if (Tn < 1 || Tn > MAXT || (head && Tn > max_t_)) { err = "metal window: window size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal window: the window runs past the context"; return false; }
-    if (!stage_.window(Tn, rows_, err)) return false;
+    if (!stage_.window(Tn, err)) return false;
     boundary_ready_ = false;
     head = head && stage_.last();
     const double t0 = now_ms();
@@ -1540,7 +1540,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         }
         tp_rg_ = now_ms() - r0;
         last_n_disp_ = (int) c.ds.size();
-        return rows_ ? finish_rows(Tn, tokens, out, t0) : finish(Tn, tokens, pos0, head, out, t0);
+        return rows_ ? finish_rows(Tn, tokens, pos0, out, t0) : finish(Tn, tokens, pos0, head, out, t0);
     }
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
     Cached& cw = wcache_[key];
@@ -1624,7 +1624,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     last_gpu_ms_ = 1000.0 * run_ds(cw);
     tp_rg_ = now_ms() - r0;
     last_n_disp_ = (int) ds.size();
-    return rows_ ? finish_rows(Tn, tokens, out, t0) : finish(Tn, tokens, pos0, head, out, t0);
+    return rows_ ? finish_rows(Tn, tokens, pos0, out, t0) : finish(Tn, tokens, pos0, head, out, t0);
 }
 
 bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err) {
@@ -1653,8 +1653,17 @@ bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64
 }
 
 // the end of a window of batch slots: the picks, and each slot's commit (a one-token step committed its row: the other history
-// parity is the committed one; the PLE history takes the row's normalized values; the session's token pair advances)
-bool Window::finish_rows(int Tn, const int32_t* tokens, int32_t* out, double t0) {
+// parity is the committed one; the PLE history takes the row's normalized values; the session's token pair advances).
+// Tier 1.5 + split stage: mirrors finish()'s own boundary-export branch below, which this path never
+// reused despite being generic in Tn and N - that gap (not the window()/StagePlan check this is paired
+// with) was the actual missing piece once a split stage's batch-slot decode was allowed through at all.
+bool Window::finish_rows(int Tn, const int32_t* tokens, int64_t pos0, int32_t* out, double t0) {
+    if (!stage_.last()) {
+        boundary_ready_ = true;
+        boundary_pos_ = pos0;
+        if (hand_out_)
+            stage_export(hand_out_, R_.as<float>(), bo_.as<float>(), inj_[0].as<float>(), Tn, N, HC);
+    }
     ++win_n_[Tn];
     win_ms_[Tn] += now_ms() - t0;
     win_gpu_[Tn] += last_gpu_ms_;

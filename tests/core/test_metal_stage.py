@@ -31,13 +31,17 @@ int main() {
     std::string err;
     StagePlan full, head, middle, tail;
     assert(full.configure(0,-1,48,4,false,err));
-    assert(full.first() && full.last() && !full.split() && full.window(8,true,err));
+    assert(full.first() && full.last() && !full.split() && full.window(8,err));
     assert(head.configure(0,24,48,4,false,err));
     assert(tail.configure(24,48,48,4,true,err));
     assert(middle.configure(8,24,48,4,true,err));
     assert(head.first() && !head.last() && !tail.first() && tail.last());
     assert(!middle.first() && !middle.last());
-    assert(head.window(1,false,err) && !head.window(2,false,err) && !head.window(1,true,err));
+    // A split stage's window() is Tier-1.5-ready: n==1 passes regardless of whether that one row is
+    // the plain single-sequence decode path or a batch-slot ("rows") call - window.cpp no longer
+    // distinguishes them here, since nothing downstream of this check does either (see stage.h's own
+    // comment). n>1 (Tier 2, multiple different sequences in one dispatch) still correctly rejected.
+    assert(head.window(1,err) && !head.window(2,err));
     StagePlan bad;
     assert(!bad.configure(-1,24,48,4,false,err));
     assert(!bad.configure(24,24,48,4,true,err));
