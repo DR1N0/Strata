@@ -23204,18 +23204,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "stage: explicit stage range required (--layers); local multi-GPU not supported\n");
             return 2;
         }
-#if !defined(STRATA_GPU_METAL)
-        // A batch slot needs its own running state and K/V before run_slot_rows can name it, and the only
-        // admission copy wired into this branch is Metal's window_slot_copy_main. Refusing here keeps --batch>1
-        // from reaching a slot that no one filled - see the compute_stage `!primed` branch for what the
-        // single-slot path does instead. This is a gate that lifts when the HIP/CUDA copy exists, not a
-        // permanent shape of the contract.
-        if (o.batch > 1) {
-            std::fprintf(stderr, "stage: --tectonic supports --batch 1 on this backend; a batch slot's own "
-                                 "state copy is Metal-only so far\n");
-            return 2;
-        }
-#endif
+        // The gate this comment used to describe ("--tectonic supports --batch 1 on this backend; a batch
+        // slot's own state copy is Metal-only so far") lifted once compute_stage's `!primed` branch grew a
+        // HIP/CUDA admission copy (conversation_checkpoint_copy/conversation_kv_copy, mirroring --serve's
+        // own copy_to_slot) - see that branch and reset_stage for the two generic-backend halves of it.
         // Tectonic (ADR 0005 addendum, "Tier 1.5"): n_slots independently resident SessionStates, one per
         // stage_worker_run slot (see its StageWorkerCompute/Reset/Prefill comments) - slot 0 reuses `ss`,
         // the session the shared setup above already carved for this stage's layer range; slots 1..n_slots-1
@@ -23432,6 +23424,15 @@ int main(int argc, char** argv) {
             // decode step always run solo (see prefill_stage/compute_stage) - see this block's declaration
             // comment on why that is correct, not a shortcut.
             strata::core::session_zero(ss, g, nullptr, main_cs);
+#if !defined(STRATA_GPU_METAL)
+            // HIP/CUDA: the slot's own SessionState (compute_stage's admission-copy destination) has the
+            // same stale-tail risk the Metal branch below describes, for the same reason - the admission
+            // copy only fills [0, upto) of it, so a slot that held a longer prior conversation keeps that
+            // conversation's K/V past that point. session_zero is the generic equivalent of
+            // window_slot_reset_main; queued on the same stream so the sync right below covers both.
+            if ((size_t) slot < slot_sessions.size())
+                strata::core::session_zero(*slot_sessions[(size_t) slot], g, nullptr, main_cs);
+#endif
             if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
                 re = "stage: session reset did not synchronize"; return false;
             }
@@ -23507,18 +23508,50 @@ int main(int argc, char** argv) {
                     if (re.empty()) re = "stage: copying solo state into the batch slot failed";
                     return false;
                 }
-                if ((size_t) slot < slot_primed.size()) slot_primed[(size_t) slot] = true;
 #else
-                // HIP/CUDA: there is no Metal window buffer to copy a solo run's state into, and no
-                // conversation_checkpoint_copy/conversation_kv_copy admission copy is wired up here yet. So
-                // `primed` deliberately stays false and every position of this stage runs solo, against the
-                // one session the request actually owns: with a single slot stage_worker_run serves one
-                // request at a time, reset_stage zeroes that session between requests, and running solo is
-                // then the same computation against the same buffers, not a shortcut around one. What it does
-                // give up is Tier 1.5's interleaving, which needs the slot copy; --batch>1 is refused at
-                // startup (see the --tectonic block) rather than reaching run_slot_rows against a slot no one
-                // filled - the silent-wrong-answer class of bug the Metal comment above describes.
+                // HIP/CUDA: the equivalent of window_slot_copy_main's admission copy, built from the same
+                // device-to-device primitives --serve's own batch admission already uses (see copy_to_slot's
+                // non-direct branch above: conversation_checkpoint_copy + conversation_kv_copy per owned QSA
+                // layer) - "a stage's own session and its batch slots" carved alike on the same device is
+                // exactly conversation_checkpoint_copy's own stated use case.
+                //
+                // The one wrinkle: conversation_checkpoint_copy wants an `ids` vector to set the restored
+                // session's ple_prev[0]/[1] (the last two tokens), but compute_stage only ever sees the single
+                // `token` just processed, not its predecessor - there is no full prompt history sitting here
+                // to hand it. checkpoint_targets (conversation_state.cpp) only ever reads ids.size(), never its
+                // contents except the last two entries, so instead of reconstructing a real history this fills
+                // a same-length vector with the one source that already has the right last-two values without
+                // needing ids at all: `ss.ple_prev` itself, just updated by the solo run/commit above - exactly
+                // what Metal's own slot_copy does (window.cpp's Window::slot_copy copies `ss_->ple_prev[...]`
+                // straight across instead of deriving it from ids).
+                if (slot < 0 || (size_t) slot >= slot_sessions.size()) {
+                    re = "stage: no such batch slot"; return false;
+                }
+                strata::core::SessionState* slot_ss = slot_sessions[(size_t) slot];
+                const int64_t upto = pos + 1;
+                std::vector<int32_t> ckpt_ids((size_t) upto, 0);
+                if (upto >= 1) ckpt_ids[(size_t) upto - 1] = ss.ple_prev[1];
+                if (upto >= 2) ckpt_ids[(size_t) upto - 2] = ss.ple_prev[0];
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    re = "stage: batch slot admission copy: device sync failed"; return false;
+                }
+                if (!strata::core::conversation_checkpoint_copy(ss, *slot_ss, ckpt_ids, g, re)) {
+                    if (re.empty()) re = "stage: copying solo state into the batch slot failed";
+                    return false;
+                }
+                for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+                    if (!strata::core::conversation_kv_copy(ss.qsa_states[ss.qsa_ord0 + j],
+                                                            slot_ss->qsa_states[slot_ss->qsa_ord0 + j], g, upto,
+                                                            /*include_index=*/true, re)) {
+                        if (re.empty()) re = "stage: copying solo K/V into the batch slot failed";
+                        return false;
+                    }
+                }
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    re = "stage: batch slot admission copy: device sync failed"; return false;
+                }
 #endif
+                if ((size_t) slot < slot_primed.size()) slot_primed[(size_t) slot] = true;
             } else {
                 const int rows[1] = {slot};
                 const int32_t toks1[1] = {token};
