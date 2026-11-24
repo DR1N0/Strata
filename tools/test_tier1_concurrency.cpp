@@ -396,15 +396,15 @@ void section_c() {
     std::fprintf(stderr, "[section C: EntryBridge admission capacity, no socket]\n");
     EntryBridge bridge;
     uint64_t id1 = 0, id2 = 0;
-    check(bridge.admit("req-X", 10, /*max_in_flight=*/1, id1), "C: first admit succeeds (capacity 1)");
+    check(bridge.admit("req-X", 10, /*max_in_flight=*/1, /*session_id=*/0, id1), "C: first admit succeeds (capacity 1)");
     check(bridge.in_flight() == 1, "C: in_flight() == 1 after one admit");
     uint64_t id2_attempt = 0;
-    check(!bridge.admit("req-Y", 10, /*max_in_flight=*/1, id2_attempt),
+    check(!bridge.admit("req-Y", 10, /*max_in_flight=*/1, /*session_id=*/0, id2_attempt),
          "C: second admit at capacity 1 is refused");
     check(bridge.in_flight() == 1, "C: in_flight() still 1 after the refused admit");
     bridge.release(id1);
     check(bridge.in_flight() == 0, "C: in_flight() == 0 after release");
-    check(bridge.admit("req-Y", 10, /*max_in_flight=*/1, id2), "C: admit succeeds again after release");
+    check(bridge.admit("req-Y", 10, /*max_in_flight=*/1, /*session_id=*/0, id2), "C: admit succeeds again after release");
     check(id2 != id1, "C: a released wire id is not reused for a different request");
     std::string resolved;
     check(bridge.resolve(id2, resolved) && resolved == "req-Y", "C: resolve() finds the newly admitted request");
@@ -415,9 +415,9 @@ void section_c() {
     // the limit is the CALLER's choice, not baked into EntryBridge.
     EntryBridge bridge2;
     uint64_t a = 0, b = 0, c3 = 0;
-    check(bridge2.admit("p", 5, /*max_in_flight=*/2, a), "C: capacity 2, first admit ok");
-    check(bridge2.admit("q", 5, /*max_in_flight=*/2, b), "C: capacity 2, second admit ok");
-    check(!bridge2.admit("r", 5, /*max_in_flight=*/2, c3), "C: capacity 2, third admit refused");
+    check(bridge2.admit("p", 5, /*max_in_flight=*/2, /*session_id=*/0, a), "C: capacity 2, first admit ok");
+    check(bridge2.admit("q", 5, /*max_in_flight=*/2, /*session_id=*/0, b), "C: capacity 2, second admit ok");
+    check(!bridge2.admit("r", 5, /*max_in_flight=*/2, /*session_id=*/0, c3), "C: capacity 2, third admit refused");
 }
 
 // ---- Section D: a real two-stage chain, timing-based proof of actual overlap ------------------------
@@ -656,6 +656,56 @@ void section_d() {
     check(err_b.empty(), "D: stage B stage_worker_run returned cleanly: " + err_b);
 }
 
+// ---- Section E: GenFields.session_id round-trips over the real wire (Tectonic ADR 0007 §4) ----------
+//
+// Sections A-D predate session_id and never set it, so none of them would notice a wrong JSON key
+// (e.g. a typo like "sesion_id") silently zeroing every session's routing key on the wire - this is the
+// one new thing control_wire.cpp actually serializes for this change, as opposed to stage_worker.hpp's
+// edits, which are one-line copies next to an already-proven request_id line each. Real sockets, not a
+// struct-to-struct comparison, so a framing-level mistake (wrong byte order, wrong field width) would
+// show here too, not just a JSON round-trip through the same process.
+void section_e() {
+    std::fprintf(stderr, "[section E: GenFields.session_id round-trips over the wire]\n");
+
+    BoundarySocket listener;
+    int port = 0;
+    std::string err;
+    check(listener.listen_on(0, port, err), "E: listener bound");
+
+    BoundarySocket server_side;
+    std::thread acceptor([&] { check(listener.accept_one(server_side, err), "E: server accepted"); });
+    BoundarySocket client_side;
+    check(client_side.connect_to("127.0.0.1", port, 5000, err), "E: client connected");
+    acceptor.join();
+
+    GenFields sent;
+    sent.request_id = "sess-req-1";
+    sent.tokens = {1, 2, 3};
+    sent.max_new = 4;
+    sent.session_id = 0xDEADBEEFCAFEULL;
+    check(control_send_gen(client_side, sent, err), "E: control_send_gen: " + err);
+
+    GenFields got;
+    std::string type;
+    check(control_recv_gen(server_side, got, type, err), "E: control_recv_gen: " + err);
+    check(type == "gen", "E: type is gen");
+    check(got.request_id == sent.request_id, "E: request_id round-trips");
+    check(got.session_id == sent.session_id,
+         "E: session_id round-trips (" + std::to_string(got.session_id) + " vs " +
+             std::to_string(sent.session_id) + ")");
+
+    // The legal-zero case (ADR 0007: "0 仍然合法，不是协议级必须非零") must not be confused with "absent".
+    GenFields zero_sent;
+    zero_sent.request_id = "sess-req-2";
+    zero_sent.tokens = {1};
+    zero_sent.max_new = 1;
+    zero_sent.session_id = 0;
+    check(control_send_gen(client_side, zero_sent, err), "E: control_send_gen (session_id 0): " + err);
+    GenFields zero_got;
+    check(control_recv_gen(server_side, zero_got, type, err), "E: control_recv_gen (session_id 0): " + err);
+    check(zero_got.session_id == 0, "E: session_id 0 round-trips as 0, not some other default");
+}
+
 }  // namespace
 
 int main() {
@@ -663,6 +713,7 @@ int main() {
     section_b();
     section_c();
     section_d();
+    section_e();
     std::fprintf(stderr, "\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

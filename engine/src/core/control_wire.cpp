@@ -167,6 +167,7 @@ bool control_send_gen(BoundarySocket& sock, const GenFields& f, std::string& err
     j["request_id"] = f.request_id;
     j["tokens"] = f.tokens;
     j["max_new"] = f.max_new;
+    j["session_id"] = f.session_id;
     return send_json(sock, j, err);
 }
 
@@ -183,6 +184,7 @@ bool gen_from_json(const json& j, GenFields& out, std::string& type_out, std::st
         for (const auto& t : j["tokens"]) out.tokens.push_back(t.get<int32_t>());
     }
     out.max_new = j.value("max_new", 0);
+    out.session_id = j.value("session_id", uint64_t(0));
     return true;
 }
 }  // namespace

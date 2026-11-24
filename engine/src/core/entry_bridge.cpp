@@ -7,7 +7,7 @@
 namespace strata::core {
 
 bool EntryBridge::admit(const std::string& tectonic_request_id, int max_new, size_t max_in_flight,
-                        uint64_t& wire_id) {
+                        uint64_t session_id, uint64_t& wire_id) {
     std::lock_guard<std::mutex> lock(mu_);
     if (entries_.size() >= max_in_flight) return false;
     wire_id = next_wire_id_++;
@@ -15,6 +15,7 @@ bool EntryBridge::admit(const std::string& tectonic_request_id, int max_new, siz
     e.tectonic_request_id = tectonic_request_id;
     e.max_new = max_new;
     e.tokens.clear();
+    e.session_id = session_id;
     return true;
 }
 

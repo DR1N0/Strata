@@ -424,7 +424,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                     } else {
                         uint64_t wire_id = 0;
                         if (!c.entry_bridge->admit(gf.request_id, gf.max_new, (size_t) std::max(1, c.batch),
-                                                   wire_id)) {
+                                                   gf.session_id, wire_id)) {
                             if (!control_send_error(link, gf.request_id, "batch_full", "no free slot for a new request",
                                                     err)) return false;
                         } else {
@@ -442,6 +442,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                                 BoundaryFrame prompt_part;
                                 prompt_part.kind = kBoundaryPrompt;
                                 prompt_part.request_id = wire_id;
+                                prompt_part.session_id = gf.session_id;
                                 prompt_part.pos0 = 0;
                                 prompt_part.rows = (int64_t) (n - 1);
                                 prompt_part.next_token.assign(gf.tokens.begin(), gf.tokens.end() - 1);
@@ -454,6 +455,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                                 BoundaryFrame prompt_part;
                                 prompt_part.kind = kBoundaryPrompt;
                                 prompt_part.request_id = wire_id;
+                                prompt_part.session_id = gf.session_id;
                                 prompt_part.pos0 = 0;
                                 prompt_part.rows = 1;
                                 prompt_part.next_token.assign(1, gf.tokens[0]);
@@ -466,6 +468,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                             BoundaryFrame first_decode;
                             first_decode.kind = kBoundaryRows;
                             first_decode.request_id = wire_id;
+                            first_decode.session_id = gf.session_id;
                             first_decode.pos0 = (int64_t) (n - 1);
                             first_decode.rows = 1;
                             first_decode.next_token.assign(1, (int32_t) last_token);
@@ -604,6 +607,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 // prompt rows, chunk by chunk.
                 if (f.kind != kBoundaryRequest) f.kind = kBoundaryPrompt;
                 f.request_id = in.request_id;
+                f.session_id = in.session_id;
                 f.layer_begin = c.lo;
                 f.layer_end = c.hi;
                 return send(f);
@@ -709,6 +713,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 BoundaryFrame cancel_end;
                 cancel_end.kind = kBoundaryEnd;
                 cancel_end.request_id = in.request_id;
+                cancel_end.session_id = in.session_id;
                 cancel_end.rows = 1;
                 cancel_end.pos0 = in.pos0;
                 cancel_end.layer_begin = c.lo;
@@ -757,6 +762,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
                 BoundaryFrame end_frame;
                 end_frame.kind = kBoundaryEnd;
                 end_frame.request_id = in.request_id;
+                end_frame.session_id = in.session_id;
                 end_frame.rows = 1;
                 end_frame.layer_begin = c.lo;
                 end_frame.layer_end = c.hi;
@@ -783,6 +789,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
         // the same way: every stage passes it through unchanged (wire v4), never renumbers it.
         out.kind = in.kind == kBoundaryPrompt ? kBoundaryPrompt : kBoundaryRows;
         out.request_id = in.request_id;
+        out.session_id = in.session_id;
         out.pos0 = in.pos0;
         out.rows = 1;
         out.layer_begin = c.lo;
@@ -830,6 +837,7 @@ inline bool stage_worker_run(const StageWorkerConfig& c, const StageWorkerComput
             BoundaryFrame next_in;
             next_in.kind = kBoundaryRows;
             next_in.request_id = in.request_id;
+            next_in.session_id = in.session_id;
             next_in.pos0 = in.pos0 + 1;
             next_in.rows = 1;
             next_in.next_token.assign(1, sampled);

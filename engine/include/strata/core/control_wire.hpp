@@ -98,6 +98,12 @@ struct GenFields {
     std::string request_id;
     std::vector<int32_t> tokens;
     int max_new = 0;
+    // The caller's session key (Tectonic ADR 0007 §4): entry normalizes this to a non-zero value for
+    // every request it admits, but 0 stays a legal value at the protocol level - a non-tectonic
+    // (`--serve`) caller of this same wire shape has no entry imposing that guarantee, and the field
+    // simply travels unread by this stage's own compute either way (see stage_worker.hpp for where it
+    // is written into the boundary frame instead of acted on here).
+    uint64_t session_id = 0;
 };
 bool control_send_gen(BoundarySocket& sock, const GenFields& f, std::string& err);
 /// `type_out` lets a caller peek what arrived without guessing; a non-"gen" message here is a protocol

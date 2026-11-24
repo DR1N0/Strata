@@ -121,6 +121,28 @@ PC（HIP 后端协作者）首次尝试在真实 HIP 环境编译 `--tectonic` �
 
 合并后用 CI 的确切命令重新编译出完整二进制（80/80 步骤无新增错误），接入真实两节点部署重跑 A→B→C 三个连续对话全部正确，三套既有回归测试全部重新跑过干净通过。合并提交 `90a4b2cb2`，工作区干净。
 
+## 2026-11-24（续）：`session_id` 从占位变成真正传递（Tectonic ADR 0007 §4）
+
+`GenFields`（`control_wire.hpp`）加 `session_id`（默认 0，协议级合法，不要求非零——非零是
+Tectonic 侧 entry 归一化的义务，不是本协议的义务）；`control_wire.cpp` 的 `control_send_gen`/
+`gen_from_json` 序列化这个字段；`EntryBridge::admit` 加同名参数，存进 `Entry`（目前没有读取方，
+存在这里只是因为准入时机恰好也是这条信息第一次可得的地方）；`stage_worker.hpp` 里三处由 `gen`
+构造 `BoundaryFrame` 的地方（`prompt_part` 两个分支、`first_decode`）写入 `gf.session_id`，另外
+六处"透传 `request_id` 的地方"（`emit` lambda、两处 `cancel_end`、`end_frame`、主循环 `out`、
+自环 `next_in`）照抄一行 `.session_id = in.session_id`——这条规则本身在 ADR 里写明了（"照
+`f.request_id = in.request_id` 抄一行"），不是这次新发明的约定。空闲超时触发的那条 `cancel_end`
+（`drain_cancelled_slots`，没有 `in` 可读）保持 `session_id` 默认 0，不编造。
+
+**验证**：`tools/test_tier1_concurrency.cpp` 新增 Section E，真实 socket 对 `control_send_gen`/
+`control_recv_gen` 做 `session_id` 往返（含非零值与合法 0 两种取值），不是只做 Go 侧或结构体层面的
+比较——这是本次改动里唯一真正新写的序列化代码，其余六处"抄一行"复用的是 `request_id` 早已被
+Section A-D 验证过的同一条路径。CPU-only 编译运行：75 checks, 0 failed（A-D 既有回归全过，证明
+这次改动没有破坏 Tier 1 / Tier 1.5 的既有行为）。Tectonic Go 侧的 `GenerateRequest.SessionHint` 提
+取、entry 归一化（`sessionIDFor`）与 `Gen.SessionID` 透传已各自在 Go 测试里验证；真实异构双机（Mac
+Metal entry + PC HIP tail）下 `session_id` 全环非零一致的端到端复验，与 B1（`--batch>1` 的 HIP 批槽
+admission copy，另见本文件/ROADMAP 相关条目）合并到同一轮，因为那轮机器资源本来就要占用，两个独
+立变量一起测比分两次测更省事，不是因为两者有依赖关系。
+
 ## 维护规则
 
 1. **产品逻辑不进引擎。** runner、orch、编排、测试框架全部放 Tectonic。哪怕代码要贴着引擎写，

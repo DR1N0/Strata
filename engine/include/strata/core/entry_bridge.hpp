@@ -33,7 +33,15 @@ public:
     /// Admits a new request, minting a wire id unique within this process. False (wire_id untouched) only
     /// when `max_in_flight` is already reached - the caller must then reply with `error{code:"batch_full"}`
     /// rather than silently queuing (docs/design/engine.md's "并发" section).
-    bool admit(const std::string& tectonic_request_id, int max_new, size_t max_in_flight, uint64_t& wire_id);
+    ///
+    /// session_id is the caller's routing key (ADR 0007 §4), recorded here alongside the request for the
+    /// same reason tectonic_request_id is: it is per-request information the bridge is the one place that
+    /// already associates with a wire_id. Nothing in this class reads it back yet - the frames that need it
+    /// get it directly from GenFields at admission time (stage_worker.hpp) - but a session's whole request
+    /// stays admitted here for the request's lifetime, so this is where that value lives if a later need
+    /// (e.g. resolving a session_id from a bare wire_id) ever reaches this file.
+    bool admit(const std::string& tectonic_request_id, int max_new, size_t max_in_flight, uint64_t session_id,
+              uint64_t& wire_id);
 
     /// The Tectonic-level string id for a wire id this bridge minted. False if not found: already
     /// released, or never admitted - a protocol error upstream, not something to guess about here.
@@ -62,6 +70,7 @@ private:
         std::string tectonic_request_id;
         int max_new = 0;
         std::vector<int32_t> tokens;
+        uint64_t session_id = 0;
     };
     std::unordered_map<uint64_t, Entry> entries_;
     // Starts at 1, not 0: every caller outside this bridge (today's un-bridged BoundaryFrame traffic -
