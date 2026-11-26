@@ -249,7 +249,7 @@ public:
               int64_t max_cells, std::string& err);
     bool set_stage(int lo, int hi, const float* in, float* out, std::string& err) {
         StagePlan plan;
-        if (!plan.configure(lo, hi, G_NL, G_QI, in != nullptr, err)) return false;
+        if (!plan.configure(lo, hi, G_NL, in != nullptr, err)) return false;
         if (ready() && (plan.begin != stage_.begin || plan.end != stage_.end)) {
             err = "metal stage: cannot change an initialized window's range"; return false;
         }

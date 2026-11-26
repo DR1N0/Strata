@@ -10,20 +10,20 @@ struct StagePlan {
     bool first() const { return begin == 0; }
     bool last() const { return end == layers; }
     bool split() const { return !first() || !last(); }
-    bool configure(int lo, int hi, int nl, int qi, bool has_input, std::string& err) {
+    // Split cuts are not required to align to QSA groups: docs/design/model-split-validation.md
+    // (Tectonic repo) ran [0,1), [0,2) and [0,22) on real Metal hardware against an unsplit
+    // baseline. [0,2) and [0,22) (misaligned, PLE 0/1 kept together) matched the baseline
+    // byte-for-byte; [0,1) (PLE 0/1 split apart) differed on a short completion but, at max_new=128
+    // with a checkable prompt, independently derived the same correct answer through a longer,
+    // more roundabout chain of reasoning - consistent with PLE's shortcut path not firing rather
+    // than a numerical error. There is accordingly no correctness basis for this function to reject
+    // any range; any model-specific advisory about where a cut is well- or ill-advised belongs in
+    // that model's own adapter (e.g. internal/model/qwen on the Tectonic side), not here - a QSA
+    // interval is Qwen/Qwen3-Next-specific, and this engine is not.
+    bool configure(int lo, int hi, int nl, bool has_input, std::string& err) {
         if (hi < 0) hi = nl;
         if (lo < 0 || lo >= hi || hi > nl || (lo > 0 && !has_input)) {
             err = "metal stage: invalid range or missing handoff input"; return false;
-        }
-        // A split stage deliberately supports whole QSA groups only; not a claim that the generic
-        // host protocol requires aligned cuts. This also keeps PLE 0/1 together. Kept as-is even
-        // after Tier 1.5 batch-slot support landed below: every configuration Tectonic currently
-        // compiles cuts on a QSA boundary already (qsa_interval's value is compile-time fixed, see
-        // geometry_checks.hpp's static_asserts), so this has never actually constrained anything in
-        // practice - relaxing it would need verifying a cut through a QSA group's internal state,
-        // which nothing has exercised, for no configuration that needs it today.
-        if ((lo != 0 || hi != nl) && (qi <= 0 || lo % qi || hi % qi)) {
-            err = "metal stage: split cuts must align to QSA groups"; return false;
         }
         begin = lo; end = hi; layers = nl;
         return true;
