@@ -13,6 +13,7 @@
 cmake_minimum_required(VERSION 3.24)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "the oldest macOS the binaries run on")
 project(strata_metal LANGUAGES C CXX OBJCXX)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/strata_symbols.cmake)   # -DSTRATA_KEEP_SYMBOLS=ON: host debug information, same machine code
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/strata_geometry.cmake)   # -DSTRATA_GEOMETRY=<name> (default flash_next, no flag added)
 
 if(NOT APPLE)
@@ -158,7 +159,7 @@ target_include_directories(strata_metal_host PUBLIC ${STRATA_ROOT}/include ${S}/
 # control_wire.cpp only (Tectonic's JSON handshake/signal messages): a header-only vendor include, see
 # the matching comment in cmake/strata_gpu_engine.cmake.
 target_include_directories(strata_metal_host PRIVATE ${STRATA_ROOT}/third_party/strata-llama/vendor)
-target_compile_definitions(strata_metal_host PUBLIC STRATA_NATIVE_EXPERTS=1 STRATA_HAVE_DFLASH2=1 STRATA_VERSION="0.1.65-metal")
+target_compile_definitions(strata_metal_host PUBLIC STRATA_NATIVE_EXPERTS=1 STRATA_HAVE_DFLASH2=1 STRATA_VERSION="0.1.69-metal")
 target_compile_options(strata_metal_host PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations)
 target_link_libraries(strata_metal_host PUBLIC strata_gpu_metal)
 if(TARGET ggml-base)   # the ggml-cpu pool (STRATA_OWN_CPU_QUANT=OFF) or a test build: ggml's headers and libraries, as before
